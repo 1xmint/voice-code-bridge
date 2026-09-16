@@ -88,14 +88,14 @@ const GATE_PATTERNS = [
   },
 ]
 
-// Only what the shell will run counts: heredoc bodies and quoted strings are
-// data (a commit message or test text that mentions "git push --force" is not
-// a force-push). A command hidden inside quotes, like bash -c "git push -f",
-// is missed; the classifier and normal prompts still see those.
+// Heredoc bodies and commit messages are data: test text or a message that
+// mentions "git push --force" is not a force-push. Other quoted text is still
+// matched on purpose, since a quoted URL (curl "https://api.x.com/...") or
+// bash -c "..." can be the real action.
 export function stripData(command) {
   let s = String(command || '')
   s = s.replace(/<<-?\s*['"]?(\w+)['"]?[^\n]*\n[\s\S]*?\n\s*\1\s*(?=\n|$)/g, '<<heredoc')
-  s = s.replace(/'[^']*'/g, "''").replace(/"(?:[^"\\]|\\.)*"/g, '""')
+  s = s.replace(/(\s(?:-m|--message)(?:\s+|=))(?:'[^']*'|"(?:[^"\\]|\\.)*")/g, '$1""')
   return s
 }
 
