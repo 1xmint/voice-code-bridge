@@ -45,5 +45,12 @@ export function getPaths(home = getHome()) {
     configPath: path.join(home, 'config.json'),
     logPath: path.join(home, 'bridge.log'),
     tasksJsonlPath: path.join(home, 'tasks.jsonl'),
+    // Appended to by scripts/agent-tree-hook.mjs (a Claude Code hook script,
+    // run from *the Claude Code process*, not this one) on SubagentStart,
+    // SubagentStop, PreToolUse, PostToolUse, Stop, and Notification.
+    eventsJsonlPath: path.join(home, 'events.jsonl'),
+    // Every message relayed between voice and Code: instructions, reports,
+    // permission requests/verdicts, cancels. Written by this process.
+    relaysJsonlPath: path.join(home, 'relays.jsonl'),
   }
 }
