@@ -25,8 +25,12 @@ function fakeChannel() {
   }
 }
 
-async function withServer(t, { channel = fakeChannel(), tasks = new TaskStore({}), decisions = new DecisionLog({}) } = {}) {
-  const server = createHttpServer({ secret: SECRET, tasks, channel, decisions })
+function tempPath(name) {
+  return path.join(os.tmpdir(), `vcb-http-test-${process.pid}-${Math.random().toString(36).slice(2)}-${name}`)
+}
+
+async function withServer(t, { channel = fakeChannel(), tasks = new TaskStore({}), decisions = new DecisionLog({}), eventsPath, relaysPath } = {}) {
+  const server = createHttpServer({ secret: SECRET, tasks, channel, decisions, eventsPath, relaysPath: relaysPath || tempPath('relays.jsonl') })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const port = server.address().port
   t.after(() => server.close())
@@ -312,4 +316,83 @@ test('status_all summarizes every task compactly, including stall and last decis
 test('status_all returns a plain message when there are no tasks', async (t) => {
   const { port } = await withServer(t)
   assert.match(await call(port, 'status_all', {}), /No tasks yet/)
+})
+
+test('tools/list includes agent_tree and list_relays', async (t) => {
+  const { port } = await withServer(t)
+  const res = await post(port, `/mcp/${SECRET}`, { jsonrpc: '2.0', id: 1, method: 'tools/list' })
+  const json = await res.json()
+  const names = json.result.tools.map((tt) => tt.name)
+  assert.ok(names.includes('agent_tree'))
+  assert.ok(names.includes('list_relays'))
+})
+
+test('agent_tree with no events file says nothing recorded yet', async (t) => {
+  const { port } = await withServer(t, { eventsPath: tempPath('no-such-events.jsonl') })
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'agent_tree', arguments: {} },
+  })
+  const json = await res.json()
+  assert.match(json.result.content[0].text, /No agent activity recorded/)
+})
+
+test('agent_tree reflects a fixture events.jsonl', async (t) => {
+  const eventsPath = tempPath('events.jsonl')
+  fs.writeFileSync(
+    eventsPath,
+    [
+      JSON.stringify({ at: new Date().toISOString(), event: 'SubagentStart', session_id: 's1', agent_id: 'a1', agent_type: 'general-purpose' }),
+      JSON.stringify({ at: new Date().toISOString(), event: 'PreToolUse', session_id: 's1', agent_id: 'a1', tool_name: 'Bash', tool_input: { command: 'npm test' } }),
+    ].join('\n') + '\n'
+  )
+  const { port } = await withServer(t, { eventsPath })
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'agent_tree', arguments: {} },
+  })
+  const json = await res.json()
+  const tree = JSON.parse(json.result.content[0].text)
+  assert.equal(tree[0].subagents[0].agent_id, 'a1')
+  assert.equal(tree[0].subagents[0].current_tool, 'Bash')
+  fs.rmSync(eventsPath)
+})
+
+test('send_to_code logs a relay, visible via list_relays', async (t) => {
+  const relaysPath = tempPath('relays.jsonl')
+  const { port } = await withServer(t, { relaysPath })
+  await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'send_to_code', arguments: { instruction: 'run the tests' } },
+  })
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: 'list_relays', arguments: {} },
+  })
+  const json = await res.json()
+  const relays = JSON.parse(json.result.content[0].text)
+  assert.equal(relays.length, 1)
+  assert.equal(relays[0].kind, 'instruction')
+  assert.equal(relays[0].preview, 'run the tests')
+  fs.rmSync(relaysPath)
+})
+
+test('list_relays with nothing recorded says so', async (t) => {
+  const { port } = await withServer(t, { relaysPath: tempPath('empty-relays.jsonl') })
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'list_relays', arguments: {} },
+  })
+  const json = await res.json()
+  assert.match(json.result.content[0].text, /No relays recorded/)
 })

@@ -2,6 +2,7 @@
 // delimited JSON-RPC on stdin/stdout. stdout carries protocol only; use
 // log() (stderr) for anything else.
 import readline from 'node:readline'
+import { logRelay } from './relays.mjs'
 
 const SERVER_INFO = { name: 'voice-code-bridge', version: '0.1.0' }
 
@@ -51,10 +52,11 @@ export function negotiateProtocolVersion(clientVersion) {
 }
 
 export class Channel {
-  constructor({ tasks, input = process.stdin, output = process.stdout, log = () => {} } = {}) {
+  constructor({ tasks, input = process.stdin, output = process.stdout, log = () => {}, relaysPath } = {}) {
     this.tasks = tasks
     this.output = output
     this.log = log
+    this.relaysPath = relaysPath
     this.ready = false
     this._rl = readline.createInterface({ input, terminal: false })
     this._rl.on('line', (line) => this._onLine(line))
@@ -86,6 +88,7 @@ export class Channel {
       const taskId = this.tasks.getActiveTaskId()
       if (taskId) {
         this.tasks.setPermissionRequest(taskId, { request_id, tool_name, description, input_preview })
+        logRelay(this.relaysPath, { from: 'code', to: 'voice', kind: 'permission_request', content: `${tool_name}: ${description}`, task_id: taskId })
       } else {
         this.log(`permission_request ${request_id} with no active task to attach it to`)
       }
@@ -135,6 +138,7 @@ export class Channel {
       if (params?.name === 'report') {
         const { task_id, status, summary, now, next, detail } = params.arguments || {}
         this.tasks.report({ task_id, status, summary, now, next, detail })
+        logRelay(this.relaysPath, { from: 'code', to: 'voice', kind: 'report', content: summary, task_id })
         this._write({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ok' }] } })
         return
       }
