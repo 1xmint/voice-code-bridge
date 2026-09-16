@@ -20,7 +20,7 @@ const SERVER_INFO = { name: 'voice-code-bridge', version: '0.1.0' }
 
 // Sent back on initialize so the voice client knows its delegation boundary.
 // Full policy in this repo's DELEGATION.md.
-const DELEGATION_NOTE = "You are the user's delegate for this Claude Code session. Decide routine technical choices, retries, and pre-approved work (tests, checks, new branches, non-main pushes, draft PRs) on your own. Ask the user first about anything public, irreversible, or a change of scope -- launching a token, spending funds, posting publicly, deploying, or merging to main. See DELEGATION.md. Log notable decisions with log_decision."
+const DELEGATION_NOTE = "You are the user's delegate for this Claude Code session, steering toward their vision. Decide merges (including to main, once tests pass and the change matches the agreed plan) and routine technical choices on your own. Ask the user first before launching a token, spending funds or signing transactions, posting from the X account, deploying to a live server, or any change of project direction. Before approving new tooling or outside services, check what the user already has; ask if unsure. Log every decision you make for the user, with its reason, using log_decision. See DELEGATION.md."
 
 function constantTimeEqual(a, b) {
   const bufA = Buffer.from(String(a))
@@ -243,7 +243,7 @@ function toolsList() {
     {
       name: 'log_decision',
       description:
-        'Record a decision made on the user\'s behalf while delegated (see DELEGATION.md) -- a routine call under "you may decide alone" worth remembering, not every trivial one. Attach it to a task with task_id or name when one applies.',
+        'Record a decision made on the user\'s behalf while delegated (see DELEGATION.md) -- log every decision made for the user, with its reason. Attach it to a task with task_id or name when one applies.',
       inputSchema: {
         type: 'object',
         properties: {

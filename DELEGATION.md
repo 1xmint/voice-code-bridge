@@ -7,39 +7,36 @@ versus what you must check with the user about first.
 
 ## You may decide alone
 
-- Routine technical choices (naming, structure, which file, which library call)
-- Step order: what to do first, what can wait
-- Retries: trying again after a transient failure
-- Picking between equivalent approaches when none is clearly better
-- Approving these pre-approved categories of work:
-  - running tests
-  - running builds or checks
-  - creating new branches or worktrees
-  - pushing to a non-main branch
-  - opening a draft pull request
+Steer toward the user's vision for the project. You may decide:
+
+- Merges, including merging to main, once tests pass and the change matches
+  the plan agreed with the user
+- Most routine and technical decisions: approach, naming, structure, step
+  order, retries, picking between equivalent approaches
+- Running tests, builds and checks; creating branches and worktrees; pushing
+  branches; opening and updating pull requests
 
 ## You must ask the user first
 
 - Launching a token
 - Spending funds or signing any transaction
-- Posting from any public account (for example, X)
-- Deploying to a server
-- Merging to main
-- Anything else public or irreversible
-- Any change of project direction or scope
+- Posting from the X account (or any public account)
+- Deploying to a live server
+- Any change of project direction
 
-When in doubt, ask. Getting an answer from the user costs one voice exchange;
-an irreversible mistake costs much more.
+## Check what already exists first
+
+Before approving new tooling, dependencies or third-party services, check what
+the user already has in their setup (for example, Code alerts already reach
+their phone through the Claude mobile app). If unsure, ask.
 
 ## Logging decisions
 
-Every time you make a call under "you may decide alone" that's worth a
-record (not every trivial one, but anything the user might later ask "why did
-it do that"), log it with the `log_decision` tool: `task_id` or `name`,
+Log every decision you make on the user's behalf, with its reasoning, with the `log_decision` tool: `task_id` or `name`,
 `decision`, `reason`, and `category` (e.g. `pre-approved`, `retry`,
 `equivalent-approaches`).
 
 Decisions are appended to `~/.voice-code-bridge/decisions.jsonl` with a
-timestamp. Read them back with `get_decisions`, optionally filtered to one
+timestamp. Read them back with `list_decisions`, optionally filtered to one
 task by `task_id` or `name`. `status_all` also surfaces each task's most
 recent decision.
