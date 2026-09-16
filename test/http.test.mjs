@@ -196,6 +196,37 @@ test('get_code_result: never waits past the time budget', async (t) => {
   assert.ok(took >= 900 && took < 3000, `took ${took}ms`)
 })
 
+test('named tasks: send by name, follow up by name, check by name', async (t) => {
+  const { port, tasks, channel } = await withServer(t)
+  await call(port, 'send_to_code', { instruction: 'look at realorrug', name: 'Realorrug' })
+  assert.match(channel.sent[0].content, /name="Realorrug"/)
+  const id = channel.sent[0].task_id
+  await call(port, 'send_to_code', { instruction: 'and run its tests', name: 'realorrug' })
+  assert.equal(channel.sent[1].task_id, id)
+  assert.equal(channel.sent[1].kind, 'followup')
+  tasks.report({ task_id: id, status: 'done', summary: 'Tests pass.', detail: 'ran 42 tests in 3 files' })
+  const status = JSON.parse(await call(port, 'get_code_status', { name: 'realorrug' }))
+  assert.equal(status.task_id, id)
+  assert.equal(status.detail, 'ran 42 tests in 3 files')
+  assert.equal(await call(port, 'get_code_result', { name: 'realorrug' }), 'Tests pass.')
+  assert.match(await call(port, 'get_code_status', { name: 'nope' }), /No task named nope/)
+})
+
+test('stall detection names the reason once a task goes quiet', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'working', summary: 'Working.' })
+  assert.equal(JSON.parse(await call(port, 'get_code_status', { task_id })).stalled, undefined)
+  tasks.getTask(task_id).last_report_at = new Date(Date.now() - 11 * 60_000).toISOString()
+  assert.match(JSON.parse(await call(port, 'get_code_status', { task_id })).stalled, /no report from Code since 11 minutes ago/)
+  tasks.createTask({ instruction: 'more', task_id })
+  tasks.getTask(task_id).followup_pending_since = new Date(Date.now() - 12 * 60_000).toISOString()
+  assert.match(JSON.parse(await call(port, 'get_code_status', { task_id })).stalled, /follow-up was sent 12 minutes ago/)
+  tasks.report({ task_id, status: 'needs_input', summary: 'Which one?' })
+  tasks.getTask(task_id).last_report_at = new Date(Date.now() - 60 * 60_000).toISOString()
+  assert.equal(JSON.parse(await call(port, 'get_code_status', { task_id })).stalled, undefined)
+})
+
 test('default time budget stays well under the voice client limit', () => {
   const prev = process.env.VCB_MAX_WAIT_SECONDS
   delete process.env.VCB_MAX_WAIT_SECONDS

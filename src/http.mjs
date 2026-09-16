@@ -41,10 +41,35 @@ function speakableAge(iso) {
 const WAITING = ['needs_approval', 'needs_input']
 const TERMINAL = ['done', 'failed', 'cancelled']
 
+function stallMinutes() {
+  const n = Number(process.env.VCB_STALL_MINUTES)
+  return process.env.VCB_STALL_MINUTES && Number.isFinite(n) && n > 0 ? n : 10
+}
+
+// A spoken note when an in-flight task has gone quiet for too long, or null.
+// Tasks waiting on the user are not stalled: the user is the blocker.
+function stallNote(task) {
+  if (WAITING.includes(task.status) || TERMINAL.includes(task.status)) return null
+  const since = task.followup_pending_since || task.last_report_at || task.created_at
+  if (Date.now() - new Date(since).getTime() < stallMinutes() * 60_000) return null
+  if (task.followup_pending_since) return `Possibly stalled: a follow-up was sent ${speakableAge(since)} and Code has not acknowledged it.`
+  if (!task.last_report_at) return `Possibly stalled: Code has not acknowledged this task, sent ${speakableAge(since)}.`
+  return `Possibly stalled: no report from Code since ${speakableAge(since)}.`
+}
+
+function resolveTaskId(tasks, args) {
+  if (args?.task_id) return args.task_id
+  if (args?.name) return tasks.findByName(args.name)?.task_id || null
+  return undefined
+}
+
 function describeStatus(task) {
   if (!task) return null
   const base = { task_id: task.task_id, status: task.status, updated_at: task.updated_at, age: speakableAge(task.updated_at) }
+  if (task.name) base.name = task.name
   base.session = path.basename(process.cwd())
+  const stall = stallNote(task)
+  if (stall) base.stalled = stall
   if (task.last_report_at) base.last_report = speakableAge(task.last_report_at)
   if (task.followup_pending_since) {
     base.followup_pending = `A follow-up was sent ${speakableAge(task.followup_pending_since)} and Code has not acknowledged it yet.`
@@ -57,6 +82,7 @@ function describeStatus(task) {
     base.latest = last.summary
     if (last.now) base.now = last.now
     if (last.next) base.next = last.next
+    if (last.detail) base.detail = last.detail
   }
   if (task.status === 'needs_approval' && task.pendingPermission) {
     const p = task.pendingPermission
@@ -117,6 +143,7 @@ function toolsList() {
           context: { type: 'string', description: 'Optional summary of the voice conversation so far, for context' },
           task_id: { type: 'string', description: 'Optional: an existing task_id to follow up on or modify, instead of starting a new task' },
           request_id: { type: 'string', description: 'Optional idempotency key; resending the same request_id returns the original task without resending it' },
+          name: { type: 'string', description: 'Optional short spoken name for the task, like "realorrug". Sending again with a name already in use (and no task_id) follows up on that task.' },
         },
         required: ['instruction'],
       },
@@ -126,7 +153,10 @@ function toolsList() {
       description: 'Check the status of a task sent to Code (queued, working, needs_approval, needs_input, done, failed, or cancelled) without waiting. A task needing the user carries an \"action\" field saying exactly what to ask and which tool to answer with. Omit task_id to check the most recent task, or to list recent tasks.',
       inputSchema: {
         type: 'object',
-        properties: { task_id: { type: 'string', description: 'Optional: which task to check. Defaults to the most recent.' } },
+        properties: {
+          task_id: { type: 'string', description: 'Optional: which task to check. Defaults to the most recent.' },
+          name: { type: 'string', description: 'Optional: the task\'s spoken name, instead of task_id.' },
+        },
       },
     },
     {
@@ -136,6 +166,7 @@ function toolsList() {
         type: 'object',
         properties: {
           task_id: { type: 'string', description: 'Optional: which task. Defaults to the most recent.' },
+          name: { type: 'string', description: 'Optional: the task\'s spoken name, instead of task_id.' },
           wait_seconds: { type: 'number', description: 'How long to wait for a new update, up to 20 seconds. Default 15.' },
         },
       },
@@ -174,13 +205,14 @@ async function callTool(name, args, { tasks, channel }) {
       if (!channel || !channel.ready) {
         return { ...text('Code is not connected right now. Open the terminal running Claude Code with the voice bridge channel enabled, then try again.'), isError: true }
       }
-      const { instruction, context, task_id, request_id } = args || {}
+      const { instruction, context, task_id, request_id, name } = args || {}
       if (!instruction || !String(instruction).trim()) {
         return { ...text('I need an instruction to send to Code.'), isError: true }
       }
-      const { task_id: id, kind, duplicate } = tasks.createTask({ instruction, context, task_id, request_id })
+      const { task_id: id, kind, duplicate, task } = tasks.createTask({ instruction, context, task_id, request_id, name })
       if (!duplicate) {
-        const parts = [`<channel source="voice-code-bridge" task_id="${id}" kind="${kind}">`]
+        const nameAttr = task?.name ? ` name="${task.name.replace(/["<>]/g, '')}"` : ''
+        const parts = [`<channel source="voice-code-bridge" task_id="${id}" kind="${kind}"${nameAttr}>`]
         if (context) parts.push(`Voice conversation context: ${context}`)
         parts.push(instruction)
         channel.sendTaskEvent({ task_id: id, kind, content: parts.join('\n') })
@@ -188,10 +220,10 @@ async function callTool(name, args, { tasks, channel }) {
       return text(`Sent to Code. task_id ${id}.`)
     }
     case 'get_code_status': {
-      const { task_id } = args || {}
-      if (task_id) {
-        const status = describeStatus(tasks.getTask(task_id))
-        if (!status) return { ...text(`No task with id ${task_id}.`), isError: true }
+      const task_id = resolveTaskId(tasks, args)
+      if (task_id !== undefined) {
+        const status = task_id && describeStatus(tasks.getTask(task_id))
+        if (!status) return { ...text(`No task ${args.task_id ? `with id ${args.task_id}` : `named ${args.name}`}.`), isError: true }
         return text(JSON.stringify(status))
       }
       const recent = tasks.listRecent(5).map(describeStatus)
@@ -199,7 +231,9 @@ async function callTool(name, args, { tasks, channel }) {
       return text(JSON.stringify(recent))
     }
     case 'get_code_result': {
-      const id = args?.task_id || tasks.getActiveTaskId()
+      const resolved = resolveTaskId(tasks, args)
+      if (resolved === null) return { ...text(`No task named ${args.name}.`), isError: true }
+      const id = resolved || tasks.getActiveTaskId()
       if (!id) return text('No tasks sent to Code yet.')
       let task = tasks.getTask(id)
       if (!task) return { ...text(`No task with id ${id}.`), isError: true }
@@ -215,7 +249,9 @@ async function callTool(name, args, { tasks, channel }) {
         task = tasks.getTask(id) || task
         if (task.reports.length === before && task.status === beforeStatus) {
           const last = task.reports[task.reports.length - 1]
-          return text(last ? `No change yet. ${narrate(task)}` : `Code is still working: ${task.status}.`)
+          const stall = stallNote(task)
+          const reply = last ? `No change yet. ${narrate(task)}` : `Code is still working: ${task.status}.`
+          return text(stall ? `${reply} ${stall}` : reply)
         }
       }
       if (actionFor(task)) return text(actionFor(task))

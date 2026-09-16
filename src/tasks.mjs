@@ -32,11 +32,13 @@ export class TaskStore {
 
   // Creates a new task, or (for a follow-up) reuses task_id. Deduplicates on
   // request_id: a repeat request_id returns the original task_id untouched.
-  createTask({ instruction, context, task_id, request_id } = {}) {
+  createTask({ instruction, context, task_id, request_id, name } = {}) {
     if (request_id && this.idempotency.has(request_id)) {
       const existingId = this.idempotency.get(request_id)
       return { task_id: existingId, task: this.tasks.get(existingId), duplicate: true }
     }
+    // A known name with no task_id continues that task ("check realorrug").
+    if (!task_id && name) task_id = this.findByName(name)?.task_id
 
     const kind = task_id && this.tasks.has(task_id) ? 'followup' : 'new'
     const id = kind === 'followup' ? task_id : newTaskId()
@@ -54,6 +56,7 @@ export class TaskStore {
         reports: [],
         pendingPermission: null,
       }
+      if (name) task.name = String(name).trim()
       this.tasks.set(id, task)
       this.order.push(id)
     } else {
@@ -69,13 +72,24 @@ export class TaskStore {
     }
 
     if (request_id) this.idempotency.set(request_id, id)
-    this._append({ event: 'task_created', task_id: id, kind, instruction, context })
+    this._append({ event: 'task_created', task_id: id, kind, name: task.name, instruction, context })
     this.events.emit('update', id)
     return { task_id: id, task, duplicate: false, kind }
   }
 
   getTask(taskId) {
     return this.tasks.get(taskId) || null
+  }
+
+  // Most recent task whose name matches, ignoring case and extra spaces.
+  findByName(name) {
+    const key = String(name || '').trim().toLowerCase()
+    if (!key) return null
+    for (let i = this.order.length - 1; i >= 0; i--) {
+      const t = this.tasks.get(this.order[i])
+      if (t?.name && t.name.toLowerCase() === key) return t
+    }
+    return null
   }
 
   getLatestTaskId() {
@@ -101,7 +115,7 @@ export class TaskStore {
   // Called from the Code (stdio) side via the `report` tool.
   // needs_input stays distinct from needs_approval: a question for the user
   // has no request_id, so the voice side must answer it with send_to_code.
-  report({ task_id, status, summary, now, next }) {
+  report({ task_id, status, summary, now, next, detail }) {
     if (!STATUSES.includes(status)) throw new Error(`invalid status: ${status}`)
     const task = this.tasks.get(task_id)
     if (!task) throw new Error(`unknown task_id: ${task_id}`)
@@ -112,6 +126,7 @@ export class TaskStore {
     const entry = { at: task.updated_at, status, summary }
     if (now) entry.now = now
     if (next) entry.next = next
+    if (detail) entry.detail = detail
     task.reports.push(entry)
     this._append({ event: 'report', ...entry, task_id })
     this.events.emit('update', task_id)

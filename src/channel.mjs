@@ -33,6 +33,7 @@ function toolsList() {
           summary: { type: 'string', description: 'Short, speakable summary. No code blocks or file dumps. For needs_input, the exact question the user must answer.' },
           now: { type: 'string', description: 'Optional: what you are doing right now, one short spoken sentence.' },
           next: { type: 'string', description: 'Optional: what you will do next, one short spoken sentence.' },
+          detail: { type: 'string', description: 'Optional: fuller written detail (steps taken, tool running, findings). Shown in status, never read aloud.' },
         },
         required: ['task_id', 'status', 'summary'],
       },
@@ -132,8 +133,8 @@ export class Channel {
   async _callTool(id, params) {
     try {
       if (params?.name === 'report') {
-        const { task_id, status, summary, now, next } = params.arguments || {}
-        this.tasks.report({ task_id, status, summary, now, next })
+        const { task_id, status, summary, now, next, detail } = params.arguments || {}
+        this.tasks.report({ task_id, status, summary, now, next, detail })
         this._write({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ok' }] } })
         return
       }
