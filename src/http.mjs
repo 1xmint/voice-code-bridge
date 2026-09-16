@@ -17,6 +17,10 @@ export function maxWaitSeconds() {
 }
 const SERVER_INFO = { name: 'voice-code-bridge', version: '0.1.0' }
 
+// Sent back on initialize so the voice client knows its delegation boundary.
+// Full policy in this repo's DELEGATION.md.
+const DELEGATION_NOTE = "You are the user's delegate for this Claude Code session. Decide routine technical choices, retries, and pre-approved work (tests, checks, new branches, non-main pushes, draft PRs) on your own. Ask the user first about anything public, irreversible, or a change of scope -- launching a token, spending funds, posting publicly, deploying, or merging to main. See DELEGATION.md. Log notable decisions with log_decision."
+
 function constantTimeEqual(a, b) {
   const bufA = Buffer.from(String(a))
   const bufB = Buffer.from(String(b))
@@ -208,7 +212,7 @@ function text(t) {
   return { content: [{ type: 'text', text: t }] }
 }
 
-async function callTool(name, args, { tasks, channel }) {
+async function callTool(name, args, { tasks, channel, decisions }) {
   switch (name) {
     case 'send_to_code': {
       if (!channel || !channel.ready) {
@@ -308,6 +312,7 @@ async function handleRpc(msg, ctx) {
         protocolVersion: params?.protocolVersion ?? '2025-06-18',
         capabilities: { tools: {} },
         serverInfo: SERVER_INFO,
+        instructions: DELEGATION_NOTE,
       })
     case 'ping':
       return ok({})
@@ -332,7 +337,7 @@ async function handleRpc(msg, ctx) {
   }
 }
 
-export function createHttpServer({ secret, tasks, channel, log = () => {} }) {
+export function createHttpServer({ secret, tasks, channel, decisions, log = () => {} }) {
   const prefix = '/mcp/'
 
   return http.createServer(async (req, res) => {
@@ -382,7 +387,7 @@ export function createHttpServer({ secret, tasks, channel, log = () => {} }) {
 
     let replies
     try {
-      replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel, log })))).filter(Boolean)
+      replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel, decisions, log })))).filter(Boolean)
     } catch (e) {
       log(`http rpc error: ${e.stack || e.message}`)
       res.writeHead(500).end()

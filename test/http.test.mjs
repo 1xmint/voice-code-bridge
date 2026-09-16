@@ -58,6 +58,7 @@ test('initialize responds with server info', async (t) => {
   const res = await post(port, `/mcp/${SECRET}`, { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
   const json = await res.json()
   assert.equal(json.result.serverInfo.name, 'voice-code-bridge')
+  assert.match(json.result.instructions, /DELEGATION.md/)
 })
 
 test('tools/list includes send_to_code', async (t) => {
