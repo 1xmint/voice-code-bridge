@@ -111,6 +111,34 @@ function pendingGatesFor(tasks, task) {
     .map((g) => ({ request_id: g.request_id, kind: g.kind, tool_name: g.tool_name, command: g.command, repo: g.repo, agent: g.agent, description: g.description }))
 }
 
+// Compact agent tree for status: the session this bridge serves (its cwd
+// matches) and every helper still running or blocked, so voice sees what Code
+// is doing without a separate call. Full detail stays in agent_tree.
+function agentsSummary(eventsPath) {
+  if (!eventsPath) return null
+  let tree
+  try {
+    tree = buildAgentTree({ eventsPath })
+  } catch {
+    return null
+  }
+  if (!tree?.length) return null
+  const brief = (a) => ({
+    who: a.agent_type === 'main' ? 'main session' : a.description || a.agent_type,
+    state: a.state,
+    step: a.current_tool ? `${a.current_tool}: ${a.current_tool_input || ''}`.slice(0, 120) : null,
+    time_on_step_s: a.time_on_step_s,
+    last_activity_s: a.last_activity_s,
+    ...(a.blocked_reason ? { blocked: a.blocked_reason } : {}),
+  })
+  const recent = tree.filter((s) => s.main && s.main.last_activity_s < 3600)
+  if (!recent.length) return null
+  return recent.map((s) => ({
+    main: brief(s.main),
+    helpers: (s.subagents || []).filter((a) => a.state !== 'done').map(brief),
+  }))
+}
+
 function describeStatus(tasks, task) {
   if (!task) return null
   const live = liveness(task)
@@ -126,17 +154,19 @@ function describeStatus(tasks, task) {
   base.session = path.basename(process.cwd())
   // Raw session state (idle / running_tool / awaiting_input) only if a hook
   // has ever set it explicitly. Never guessed from timers.
-  base.session_state = task.session_state || 'unknown'
+  if (task.session_state) base.session_state = task.session_state
   if (live.tier === 'stalled') base.stalled = live.reason
   if (live.tier === 'idle') base.idle = live.reason
   if (task.last_report_at) base.last_report = speakableAge(task.last_report_at)
   if (task.followup_pending_since) {
     base.followup_pending = `A follow-up was sent ${speakableAge(task.followup_pending_since)} and Code has not acknowledged it yet.`
   }
-  const followups = followupQueue(task)
-  if (followups.length) {
-    base.pending_followups = followups
-    base.unread_followups = followups.filter((f) => !f.acknowledged).length
+  // Only follow-ups Code has not acknowledged: the full history made status
+  // too long to read aloud.
+  const unread = followupQueue(task).filter((f) => !f.acknowledged)
+  if (unread.length) {
+    base.pending_followups = unread
+    base.unread_followups = unread.length
   }
   const gates = pendingGatesFor(tasks, task)
   if (gates.length) base.pending_gates = gates
@@ -401,11 +431,14 @@ async function callTool(name, args, { tasks, channel, decisions, eventsPath, rel
       if (task_id !== undefined) {
         const status = task_id && describeStatus(tasks, tasks.getTask(task_id))
         if (!status) return { ...text(`No task ${args.task_id ? `with id ${args.task_id}` : `named ${args.name}`}.`), isError: true }
+        const agents = agentsSummary(eventsPath)
+        if (agents) status.agents = agents
         return text(JSON.stringify(status))
       }
       const recent = tasks.listRecent(5).map((t) => describeStatus(tasks, t))
       if (recent.length === 0) return text('No tasks sent to Code yet.')
-      return text(JSON.stringify(recent))
+      const agents = agentsSummary(eventsPath)
+      return text(JSON.stringify(agents ? { agents, tasks: recent } : recent))
     }
     case 'get_code_result': {
       const resolved = resolveTaskId(tasks, args)
