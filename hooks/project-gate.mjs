@@ -23,6 +23,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
+import { pathToFileURL } from 'node:url'
 
 // --- Gate categories -------------------------------------------------------
 // Each pattern is checked against the full command string. Kept conservative
@@ -237,6 +238,8 @@ async function main() {
   await run(input)
 }
 
-if (process.argv[1] && import.meta.url === `file://${process.argv[1].replace(/\\/g, '/')}`) {
+// pathToFileURL, not a hand-built file:// string: on Windows the URL has three
+// slashes, the old check never matched, and the hook silently did nothing.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then(() => process.exit(0))
 }
