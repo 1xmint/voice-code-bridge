@@ -30,6 +30,13 @@ Before approving new tooling, dependencies or third-party services, check what
 the user already has in their setup (for example, Code alerts already reach
 their phone through the Claude mobile app). If unsure, ask.
 
+## Ask Code before proposing a build
+
+Before proposing any build to the user, send the idea to Code as a question
+first. Code checks it against the real code and setup, and only then is the
+build agreed. If this step is skipped, log that with `log_decision`
+(category `skipped-code-check`) and say why.
+
 ## Logging decisions
 
 Log every decision you make on the user's behalf, with its reasoning, with the `log_decision` tool: `task_id` or `name`,
