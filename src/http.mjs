@@ -4,6 +4,8 @@
 import http from 'node:http'
 import crypto from 'node:crypto'
 import path from 'node:path'
+import { buildAgentTree } from './events.mjs'
+import { logRelay, listRelays } from './relays.mjs'
 
 const MAX_BODY_BYTES = 1_000_000
 
@@ -193,6 +195,24 @@ function toolsList() {
       },
     },
     {
+      name: 'agent_tree',
+      description:
+        'See every agent Claude Code is running right now, in one call: for each session, the main agent and every sub-agent it spawned, each with its assigned goal, current tool or command, how long it has been on that step, when it last did anything, its state (running, blocked, waiting, or done), a short recent-action log, and what each parent is waiting on. Use this when the user asks what Code (or its sub-agents) is doing, whether something is stuck, or wants the whole picture instead of just "working".',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'list_relays',
+      description:
+        'List recent messages relayed between voice and Code: instructions sent, progress reports, permission requests and verdicts, cancels. Filterable by task_id. Use when the user asks what was sent or said, or wants a history of a task.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'Optional: only relays for this task' },
+          limit: { type: 'number', description: 'Max relays to return, default 20' },
+        },
+      },
+    },
+    {
       name: 'timing_probe',
       description: 'Diagnostic only. Waits the given number of seconds, then replies with the word "lighthouse". Use ONLY when the user explicitly asks for the timing probe or timing test; never for real work.',
       inputSchema: {
@@ -208,7 +228,7 @@ function text(t) {
   return { content: [{ type: 'text', text: t }] }
 }
 
-async function callTool(name, args, { tasks, channel }) {
+async function callTool(name, args, { tasks, channel, eventsPath, relaysPath }) {
   switch (name) {
     case 'send_to_code': {
       if (!channel || !channel.ready) {
@@ -225,6 +245,7 @@ async function callTool(name, args, { tasks, channel }) {
         if (context) parts.push(`Voice conversation context: ${context}`)
         parts.push(instruction)
         channel.sendTaskEvent({ task_id: id, kind, content: parts.join('\n') })
+        logRelay(relaysPath, { from: 'voice', to: 'code', kind: 'instruction', content: instruction, task_id: id })
       }
       return text(`Sent to Code. task_id ${id}.`)
     }
@@ -276,6 +297,7 @@ async function callTool(name, args, { tasks, channel }) {
       if (!owner) return { ...text('No pending approval with that id. It may have already been answered.'), isError: true }
       channel.sendPermissionVerdict(request_id, decision)
       tasks.clearPermissionRequest(owner.task_id, decision)
+      logRelay(relaysPath, { from: 'voice', to: 'code', kind: 'permission_verdict', content: decision, task_id: owner.task_id })
       return text(`Sent ${decision}.`)
     }
     case 'cancel_code_task': {
@@ -283,7 +305,18 @@ async function callTool(name, args, { tasks, channel }) {
       const task = tasks.cancel(task_id)
       if (!task) return { ...text(`No task with id ${task_id}.`), isError: true }
       channel?.sendCancelEvent({ task_id })
+      logRelay(relaysPath, { from: 'voice', to: 'code', kind: 'cancel', content: 'cancelled', task_id })
       return text(`Cancelled task ${task_id}.`)
+    }
+    case 'agent_tree': {
+      const tree = buildAgentTree({ eventsPath })
+      if (tree.length === 0) return text('No agent activity recorded yet. The agent-tree hook may not be configured; see README.')
+      return text(JSON.stringify(tree))
+    }
+    case 'list_relays': {
+      const relays = listRelays(relaysPath, { task_id: args?.task_id, limit: args?.limit })
+      if (relays.length === 0) return text('No relays recorded yet.')
+      return text(JSON.stringify(relays))
     }
     case 'timing_probe': {
       // Kept under Cloudflare's 100 s origin limit so a quick tunnel doesn't confound the result.
@@ -332,7 +365,7 @@ async function handleRpc(msg, ctx) {
   }
 }
 
-export function createHttpServer({ secret, tasks, channel, log = () => {} }) {
+export function createHttpServer({ secret, tasks, channel, log = () => {}, eventsPath, relaysPath }) {
   const prefix = '/mcp/'
 
   return http.createServer(async (req, res) => {
@@ -382,7 +415,7 @@ export function createHttpServer({ secret, tasks, channel, log = () => {} }) {
 
     let replies
     try {
-      replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel, log })))).filter(Boolean)
+      replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel, log, eventsPath, relaysPath })))).filter(Boolean)
     } catch (e) {
       log(`http rpc error: ${e.stack || e.message}`)
       res.writeHead(500).end()

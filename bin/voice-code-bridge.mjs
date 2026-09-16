@@ -31,8 +31,8 @@ async function main() {
 
   const log = makeLogger(paths.logPath)
   const tasks = new TaskStore({ jsonlPath: paths.tasksJsonlPath })
-  const channel = new Channel({ tasks, log })
-  const server = createHttpServer({ secret: config.secret, tasks, channel, log })
+  const channel = new Channel({ tasks, log, relaysPath: paths.relaysJsonlPath })
+  const server = createHttpServer({ secret: config.secret, tasks, channel, log, eventsPath: paths.eventsJsonlPath, relaysPath: paths.relaysJsonlPath })
   const port = getPort()
 
   // The bridge is registered for every Claude Code session, but only the
