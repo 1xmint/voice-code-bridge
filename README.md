@@ -36,12 +36,14 @@ handling.
 
 ## What's not yet proven
 
-- **How long voice mode is willing to wait on a single tool call.** The
-  design avoids long waits on purpose: `send_to_code` returns immediately
-  with a `task_id`, and `get_code_result` long-polls for a bounded number of
-  seconds (default 15, max 25) rather than blocking until Code finishes.
-  Whether that's the right ceiling for voice mode's own timeout hasn't been
-  tested end to end yet.
+- **Exactly how long voice mode will wait on a single tool call.** Measured
+  so far (2026-09-16): a 3 second call works; a 30 second call fails in the
+  app with "MCP tool call failed" even though the server finished it and a
+  quick tunnel carries 30 and 110 second calls fine. So the client limit sits
+  somewhere under about 31 seconds. `get_code_result` therefore long-polls
+  for at most 20 seconds (default 15; override with `VCB_MAX_WAIT_SECONDS`)
+  and answers "no change yet" rather than blocking until Code finishes. Each
+  tool call's duration is written to `bridge.log`.
 - **The full loop against a real Claude Code channel session.** The stdio
   side has been tested by acting as Claude Code (a scripted client that
   sends `initialize`, `tools/call report`, and permission notifications —

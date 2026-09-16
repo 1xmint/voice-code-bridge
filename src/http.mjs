@@ -3,8 +3,18 @@
 // in docs/.proven-test-server.mjs. Only POST /mcp/<secret> is served.
 import http from 'node:http'
 import crypto from 'node:crypto'
+import path from 'node:path'
 
 const MAX_BODY_BYTES = 1_000_000
+
+// Voice mode gives up on a tool call after roughly 30 seconds: a 30 second
+// wait_then_reply finished on the server and through the tunnel, yet the app
+// reported "MCP tool call failed"; a 3 second one worked. Every long-poll must
+// answer well inside that, leaving room for tunnel latency.
+export function maxWaitSeconds() {
+  const n = Number(process.env.VCB_MAX_WAIT_SECONDS)
+  return process.env.VCB_MAX_WAIT_SECONDS && Number.isFinite(n) && n >= 0 ? n : 20
+}
 const SERVER_INFO = { name: 'voice-code-bridge', version: '0.1.0' }
 
 function constantTimeEqual(a, b) {
@@ -34,6 +44,14 @@ const TERMINAL = ['done', 'failed', 'cancelled']
 function describeStatus(task) {
   if (!task) return null
   const base = { task_id: task.task_id, status: task.status, updated_at: task.updated_at, age: speakableAge(task.updated_at) }
+  base.session = path.basename(process.cwd())
+  if (task.last_report_at) base.last_report = speakableAge(task.last_report_at)
+  if (task.followup_pending_since) {
+    base.followup_pending = `A follow-up was sent ${speakableAge(task.followup_pending_since)} and Code has not acknowledged it yet.`
+  }
+  if (task.reports.length > 1) {
+    base.recent = task.reports.slice(-4, -1).map((r) => `${speakableAge(r.at)}: ${r.summary}`)
+  }
   const last = task.reports[task.reports.length - 1]
   if (last) {
     base.latest = last.summary
@@ -118,7 +136,7 @@ function toolsList() {
         type: 'object',
         properties: {
           task_id: { type: 'string', description: 'Optional: which task. Defaults to the most recent.' },
-          wait_seconds: { type: 'number', description: 'How long to wait for a new update, up to 25 seconds. Default 15.' },
+          wait_seconds: { type: 'number', description: 'How long to wait for a new update, up to 20 seconds. Default 15.' },
         },
       },
     },
@@ -185,7 +203,10 @@ async function callTool(name, args, { tasks, channel }) {
       if (!id) return text('No tasks sent to Code yet.')
       let task = tasks.getTask(id)
       if (!task) return { ...text(`No task with id ${id}.`), isError: true }
-      const waitSeconds = Math.min(Math.max(Number(args?.wait_seconds) || 15, 0), 25)
+      // `|| 15` used to turn an explicit 0 into a 15 second wait.
+      const raw = args?.wait_seconds
+      const requested = raw == null || raw === '' ? 15 : Number(raw)
+      const waitSeconds = Math.min(Math.max(Number.isFinite(requested) ? requested : 15, 0), maxWaitSeconds())
       // Waiting on the user or finished: answer at once, never long-poll.
       if (!WAITING.includes(task.status) && !TERMINAL.includes(task.status) && waitSeconds > 0) {
         const before = task.reports.length
@@ -243,7 +264,9 @@ async function handleRpc(msg, ctx) {
       return ok({ tools: toolsList() })
     case 'tools/call': {
       try {
+        const started = Date.now()
         const result = await callTool(params.name, params.arguments, ctx)
+        ctx.log?.(`tools/call ${params.name} ${Date.now() - started}ms${result.isError ? ' isError' : ''}`)
         const banner = attentionBanner(ctx.tasks, params.arguments?.task_id)
         if (banner && params.name !== 'get_code_status' && result.content?.[0]?.type === 'text') {
           result.content[0].text = banner + result.content[0].text
@@ -295,7 +318,7 @@ export function createHttpServer({ secret, tasks, channel, log = () => {} }) {
     const messages = batch ? parsed : [parsed]
     let replies
     try {
-      replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel })))).filter(Boolean)
+      replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel, log })))).filter(Boolean)
     } catch (e) {
       log(`http rpc error: ${e.stack || e.message}`)
       res.writeHead(500).end()
