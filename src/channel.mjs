@@ -14,6 +14,9 @@ const INSTRUCTIONS = [
   'can continue, call report with status "needs_input" and a short question in summary.',
   'Summaries are read aloud by voice mode: keep them short, plain spoken language, no code',
   'blocks, no file paths or diffs, no markdown.',
+  'When a task or follow-up arrives, call report with "working" right away, even if the work',
+  'must wait behind something else (say what it waits on), so voice never sees it as unacknowledged.',
+  'Always pass the task_id from the channel tag the report is about, not the latest one.',
 ].join(' ')
 
 function toolsList() {

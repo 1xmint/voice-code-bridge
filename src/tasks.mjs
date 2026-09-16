@@ -59,7 +59,12 @@ export class TaskStore {
     } else {
       task.instruction = instruction
       task.context = context || task.context
-      task.status = 'queued'
+      // A follow-up to a task Code is still working on must not flip it back
+      // to "queued": the session keeps working and voice would hear it as
+      // stuck. Mark the follow-up unacknowledged instead; the next report
+      // clears it. Finished or waiting tasks do go back to queued.
+      if (!['working', 'needs_approval'].includes(task.status)) task.status = 'queued'
+      task.followup_pending_since = now
       task.updated_at = now
     }
 
@@ -102,6 +107,8 @@ export class TaskStore {
     if (!task) throw new Error(`unknown task_id: ${task_id}`)
     task.status = status
     task.updated_at = new Date().toISOString()
+    task.last_report_at = task.updated_at
+    delete task.followup_pending_since
     const entry = { at: task.updated_at, status, summary }
     if (now) entry.now = now
     if (next) entry.next = next

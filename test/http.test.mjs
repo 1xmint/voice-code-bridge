@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createHttpServer } from '../src/http.mjs'
+import { createHttpServer, maxWaitSeconds } from '../src/http.mjs'
 import { TaskStore } from '../src/tasks.mjs'
 
 const SECRET = 'test-secret-value'
@@ -129,4 +129,79 @@ test('permission request: status and result expose request_id and prompt text', 
   assert.equal(status.request_id, 'abcde')
   assert.equal(status.approval_details, 'tailscale funnel --bg 8790')
   assert.match(await call(port, 'get_code_result', { task_id }), /Turn on Tailscale Funnel.*request_id abcde/)
+})
+
+test('follow-up to a working task stays working and is flagged until Code reports', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'working', summary: 'Started.' })
+  tasks.createTask({ instruction: 'also do y', task_id })
+  let status = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(status.status, 'working')
+  assert.match(status.followup_pending, /not acknowledged/)
+  tasks.report({ task_id, status: 'working', summary: 'Got the follow-up.' })
+  status = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(status.followup_pending, undefined)
+  assert.equal(status.recent.length, 1)
+  assert.ok(status.session)
+  assert.ok(status.last_report)
+})
+
+test('follow-up to a finished task goes back to queued', () => {
+  const tasks = new TaskStore({})
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'done', summary: 'Done.' })
+  tasks.createTask({ instruction: 'more', task_id })
+  assert.equal(tasks.getTask(task_id).status, 'queued')
+})
+
+test('get_code_result: wait_seconds 0 answers at once', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  const started = Date.now()
+  assert.match(await call(port, 'get_code_result', { task_id, wait_seconds: 0 }), /still working/)
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started}ms`)
+})
+
+test('get_code_result: held open until Code reports done', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'working', summary: 'Working.' })
+  setTimeout(() => tasks.report({ task_id, status: 'done', summary: 'All finished.' }), 300)
+  const started = Date.now()
+  assert.equal(await call(port, 'get_code_result', { task_id, wait_seconds: 10 }), 'All finished.')
+  assert.ok(Date.now() - started < 3000)
+})
+
+test('get_code_result: held open until Code asks a question', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  setTimeout(() => tasks.report({ task_id, status: 'needs_input', summary: 'Merge it?' }), 300)
+  assert.match(await call(port, 'get_code_result', { task_id, wait_seconds: 10 }), /Merge it\?.*send_to_code/)
+})
+
+test('get_code_result: never waits past the time budget', async (t) => {
+  const prev = process.env.VCB_MAX_WAIT_SECONDS
+  process.env.VCB_MAX_WAIT_SECONDS = '1'
+  t.after(() => {
+    if (prev === undefined) delete process.env.VCB_MAX_WAIT_SECONDS
+    else process.env.VCB_MAX_WAIT_SECONDS = prev
+  })
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'working', summary: 'Working.' })
+  const started = Date.now()
+  assert.match(await call(port, 'get_code_result', { task_id, wait_seconds: 600 }), /^No change yet\. Working\./)
+  const took = Date.now() - started
+  assert.ok(took >= 900 && took < 3000, `took ${took}ms`)
+})
+
+test('default time budget stays well under the voice client limit', () => {
+  const prev = process.env.VCB_MAX_WAIT_SECONDS
+  delete process.env.VCB_MAX_WAIT_SECONDS
+  try {
+    assert.ok(maxWaitSeconds() <= 20)
+  } finally {
+    if (prev !== undefined) process.env.VCB_MAX_WAIT_SECONDS = prev
+  }
 })
