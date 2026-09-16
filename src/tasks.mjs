@@ -112,6 +112,13 @@ export class TaskStore {
       .map((id) => this.tasks.get(id))
   }
 
+  // Every task this process currently knows about, newest first. There is no
+  // archiving yet -- tasks live for the process lifetime -- so this is the
+  // full set.
+  listAll() {
+    return this.order.slice().reverse().map((id) => this.tasks.get(id))
+  }
+
   // Called from the Code (stdio) side via the `report` tool.
   // needs_input stays distinct from needs_approval: a question for the user
   // has no request_id, so the voice side must answer it with send_to_code.

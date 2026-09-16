@@ -1,7 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { createHttpServer, maxWaitSeconds } from '../src/http.mjs'
 import { TaskStore } from '../src/tasks.mjs'
+import { DecisionLog } from '../src/decisions.mjs'
+
+function tempDecisionLog() {
+  return new DecisionLog({ jsonlPath: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vcb-http-decisions-')), 'decisions.jsonl') })
+}
 
 const SECRET = 'test-secret-value'
 
@@ -17,12 +25,12 @@ function fakeChannel() {
   }
 }
 
-async function withServer(t, { channel = fakeChannel(), tasks = new TaskStore({}) } = {}) {
-  const server = createHttpServer({ secret: SECRET, tasks, channel })
+async function withServer(t, { channel = fakeChannel(), tasks = new TaskStore({}), decisions = new DecisionLog({}) } = {}) {
+  const server = createHttpServer({ secret: SECRET, tasks, channel, decisions })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const port = server.address().port
   t.after(() => server.close())
-  return { port, tasks, channel }
+  return { port, tasks, channel, decisions }
 }
 
 async function post(port, path, body) {
@@ -58,6 +66,7 @@ test('initialize responds with server info', async (t) => {
   const res = await post(port, `/mcp/${SECRET}`, { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
   const json = await res.json()
   assert.equal(json.result.serverInfo.name, 'voice-code-bridge')
+  assert.match(json.result.instructions, /DELEGATION.md/)
 })
 
 test('tools/list includes send_to_code', async (t) => {
@@ -235,4 +244,72 @@ test('default time budget stays well under the voice client limit', () => {
   } finally {
     if (prev !== undefined) process.env.VCB_MAX_WAIT_SECONDS = prev
   }
+})
+
+test('tools/list includes log_decision, list_decisions, status_all', async (t) => {
+  const { port } = await withServer(t)
+  const res = await post(port, `/mcp/${SECRET}`, { jsonrpc: '2.0', id: 1, method: 'tools/list' })
+  const json = await res.json()
+  const names = json.result.tools.map((tool) => tool.name)
+  assert.ok(names.includes('log_decision'))
+  assert.ok(names.includes('list_decisions'))
+  assert.ok(names.includes('status_all'))
+})
+
+test('log_decision requires a decision and persists it against a task_id', async (t) => {
+  const { port, decisions } = await withServer(t, { decisions: tempDecisionLog() })
+  const missing = JSON.parse('{}')
+  const err = await post(port, `/mcp/${SECRET}`, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'log_decision', arguments: missing } })
+  assert.equal((await err.json()).result.isError, true)
+  const reply = await call(port, 'log_decision', { task_id: 'abc', decision: 'used the existing helper', reason: 'no need to duplicate it', category: 'equivalent-approaches' })
+  assert.match(reply, /used the existing helper/)
+  const recent = decisions.listRecent({ task_id: 'abc' })
+  assert.equal(recent.length, 1)
+  assert.equal(recent[0].reason, 'no need to duplicate it')
+})
+
+test('log_decision resolves a task_id from name when only name is given', async (t) => {
+  const { port, tasks, decisions } = await withServer(t, { decisions: tempDecisionLog() })
+  const { task_id } = tasks.createTask({ instruction: 'x', name: 'realorrug' })
+  await call(port, 'log_decision', { name: 'realorrug', decision: 'retried once' })
+  assert.equal(decisions.lastForTask(task_id).decision, 'retried once')
+})
+
+test('list_decisions filters by task_id and returns newest first', async (t) => {
+  const { port } = await withServer(t, { decisions: tempDecisionLog() })
+  await call(port, 'log_decision', { task_id: 'a', decision: 'one' })
+  await call(port, 'log_decision', { task_id: 'b', decision: 'two' })
+  await call(port, 'log_decision', { task_id: 'a', decision: 'three' })
+  const list = JSON.parse(await call(port, 'list_decisions', { task_id: 'a' }))
+  assert.equal(list.length, 2)
+  assert.equal(list[0].decision, 'three')
+})
+
+test('list_decisions says so when there are none yet', async (t) => {
+  const { port } = await withServer(t)
+  assert.match(await call(port, 'list_decisions', {}), /No decisions logged yet/)
+})
+
+test('status_all summarizes every task compactly, including stall and last decision', async (t) => {
+  const { port, tasks } = await withServer(t, { decisions: tempDecisionLog() })
+  const a = tasks.createTask({ instruction: 'x', name: 'alpha' }).task_id
+  tasks.report({ task_id: a, status: 'working', summary: 'Working on alpha.' })
+  await call(port, 'log_decision', { task_id: a, decision: 'skipped the extra check', reason: 'covered by an existing test' })
+  const b = tasks.createTask({ instruction: 'y', name: 'beta' }).task_id
+  tasks.report({ task_id: b, status: 'needs_input', summary: 'Which branch?' })
+
+  const list = JSON.parse(await call(port, 'status_all', {}))
+  assert.equal(list.length, 2)
+  const alpha = list.find((t) => t.task_id === a)
+  assert.equal(alpha.name, 'alpha')
+  assert.equal(alpha.summary, 'Working on alpha.')
+  assert.equal(alpha.stalled, undefined)
+  assert.match(alpha.last_decision, /skipped the extra check.*covered by an existing test/)
+  const beta = list.find((t) => t.task_id === b)
+  assert.equal(beta.question, 'Which branch?')
+})
+
+test('status_all returns a plain message when there are no tasks', async (t) => {
+  const { port } = await withServer(t)
+  assert.match(await call(port, 'status_all', {}), /No tasks yet/)
 })
