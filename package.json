@@ -1,0 +1,16 @@
+{
+  "name": "voice-code-bridge",
+  "version": "0.1.0",
+  "description": "Talk to your live Claude Code session from Claude voice mode.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "voice-code-bridge": "bin/voice-code-bridge.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
