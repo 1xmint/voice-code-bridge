@@ -45,5 +45,6 @@ export function getPaths(home = getHome()) {
     configPath: path.join(home, 'config.json'),
     logPath: path.join(home, 'bridge.log'),
     tasksJsonlPath: path.join(home, 'tasks.jsonl'),
+    decisionsJsonlPath: path.join(home, 'decisions.jsonl'),
   }
 }
