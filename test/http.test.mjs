@@ -25,8 +25,12 @@ function fakeChannel() {
   }
 }
 
-async function withServer(t, { channel = fakeChannel(), tasks = new TaskStore({}), decisions = new DecisionLog({}) } = {}) {
-  const server = createHttpServer({ secret: SECRET, tasks, channel, decisions })
+function tempPath(name) {
+  return path.join(os.tmpdir(), `vcb-http-test-${process.pid}-${Math.random().toString(36).slice(2)}-${name}`)
+}
+
+async function withServer(t, { channel = fakeChannel(), tasks = new TaskStore({}), decisions = new DecisionLog({}), eventsPath, relaysPath } = {}) {
+  const server = createHttpServer({ secret: SECRET, tasks, channel, decisions, eventsPath, relaysPath: relaysPath || tempPath('relays.jsonl') })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const port = server.address().port
   t.after(() => server.close())
@@ -227,7 +231,13 @@ test('stall detection names the reason once a task goes quiet', async (t) => {
   tasks.report({ task_id, status: 'working', summary: 'Working.' })
   assert.equal(JSON.parse(await call(port, 'get_code_status', { task_id })).stalled, undefined)
   tasks.getTask(task_id).last_report_at = new Date(Date.now() - 11 * 60_000).toISOString()
+  tasks.getTask(task_id).last_activity_at = tasks.getTask(task_id).last_report_at
   assert.match(JSON.parse(await call(port, 'get_code_status', { task_id })).stalled, /no report from Code since 11 minutes ago/)
+  {
+    const s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+    assert.equal(s.status, 'stalled')
+    assert.equal(s.raw_status, 'working')
+  }
   tasks.createTask({ instruction: 'more', task_id })
   tasks.getTask(task_id).followup_pending_since = new Date(Date.now() - 12 * 60_000).toISOString()
   assert.match(JSON.parse(await call(port, 'get_code_status', { task_id })).stalled, /follow-up was sent 12 minutes ago/)
@@ -312,4 +322,210 @@ test('status_all summarizes every task compactly, including stall and last decis
 test('status_all returns a plain message when there are no tasks', async (t) => {
   const { port } = await withServer(t)
   assert.match(await call(port, 'status_all', {}), /No tasks yet/)
+})
+
+test('tools/list includes agent_tree and list_relays', async (t) => {
+  const { port } = await withServer(t)
+  const res = await post(port, `/mcp/${SECRET}`, { jsonrpc: '2.0', id: 1, method: 'tools/list' })
+  const json = await res.json()
+  const names = json.result.tools.map((tt) => tt.name)
+  assert.ok(names.includes('agent_tree'))
+  assert.ok(names.includes('list_relays'))
+})
+
+test('agent_tree with no events file says nothing recorded yet', async (t) => {
+  const { port } = await withServer(t, { eventsPath: tempPath('no-such-events.jsonl') })
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'agent_tree', arguments: {} },
+  })
+  const json = await res.json()
+  assert.match(json.result.content[0].text, /No agent activity recorded/)
+})
+
+test('agent_tree reflects a fixture events.jsonl', async (t) => {
+  const eventsPath = tempPath('events.jsonl')
+  fs.writeFileSync(
+    eventsPath,
+    [
+      JSON.stringify({ at: new Date().toISOString(), event: 'SubagentStart', session_id: 's1', agent_id: 'a1', agent_type: 'general-purpose' }),
+      JSON.stringify({ at: new Date().toISOString(), event: 'PreToolUse', session_id: 's1', agent_id: 'a1', tool_name: 'Bash', tool_input: { command: 'npm test' } }),
+    ].join('\n') + '\n'
+  )
+  const { port } = await withServer(t, { eventsPath })
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'agent_tree', arguments: {} },
+  })
+  const json = await res.json()
+  const tree = JSON.parse(json.result.content[0].text)
+  assert.equal(tree[0].subagents[0].agent_id, 'a1')
+  assert.equal(tree[0].subagents[0].current_tool, 'Bash')
+  fs.rmSync(eventsPath)
+})
+
+test('send_to_code logs a relay, visible via list_relays', async (t) => {
+  const relaysPath = tempPath('relays.jsonl')
+  const { port } = await withServer(t, { relaysPath })
+  await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'send_to_code', arguments: { instruction: 'run the tests' } },
+  })
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: 'list_relays', arguments: {} },
+  })
+  const json = await res.json()
+  const relays = JSON.parse(json.result.content[0].text)
+  assert.equal(relays.length, 1)
+  assert.equal(relays[0].kind, 'instruction')
+  assert.equal(relays[0].preview, 'run the tests')
+  fs.rmSync(relaysPath)
+})
+
+test('list_relays with nothing recorded says so', async (t) => {
+  const { port } = await withServer(t, { relaysPath: tempPath('empty-relays.jsonl') })
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'list_relays', arguments: {} },
+  })
+  const json = await res.json()
+  assert.match(json.result.content[0].text, /No relays recorded/)
+})
+
+test('idle tier fires before stalled, and never overrides a waiting/terminal status', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'working', summary: 'Working.' })
+  tasks.getTask(task_id).last_report_at = new Date(Date.now() - 6 * 60_000).toISOString()
+  tasks.getTask(task_id).last_activity_at = tasks.getTask(task_id).last_report_at
+  const s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.status, 'idle')
+  assert.equal(s.raw_status, 'working')
+  assert.match(s.idle, /no activity from Code in 6 minutes ago/)
+  assert.equal(s.stalled, undefined)
+
+  const other = tasks.createTask({ instruction: 'y' }).task_id
+  tasks.report({ task_id: other, status: 'needs_input', summary: 'Which file?' })
+  tasks.getTask(other).last_report_at = new Date(Date.now() - 60 * 60_000).toISOString()
+  const s2 = JSON.parse(await call(port, 'get_code_status', { task_id: other }))
+  assert.equal(s2.status, 'needs_input')
+  assert.equal(s2.idle, undefined)
+})
+
+test('recordActivity keeps a task off the idle/stalled tiers without a report', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'working', summary: 'Working.' })
+  tasks.getTask(task_id).last_report_at = new Date(Date.now() - 20 * 60_000).toISOString()
+  // A hook-reported tool event (no report call) is fresh activity.
+  tasks.recordActivity(task_id, { source: 'tool', detail: 'Bash: npm test' })
+  const s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.status, 'working')
+  assert.equal(s.stalled, undefined)
+  assert.equal(s.idle, undefined)
+})
+
+test('queue visibility: every pending follow-up, acknowledgement, and unread count', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'first' })
+  tasks.report({ task_id, status: 'working', summary: 'Started.' })
+  tasks.createTask({ instruction: 'also do y', task_id })
+  tasks.createTask({ instruction: 'and z', task_id })
+  let s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.pending_followups.length, 2)
+  assert.equal(s.pending_followups[0].text, 'also do y')
+  assert.equal(s.pending_followups[0].acknowledged, false)
+  assert.equal(s.unread_followups, 2)
+  tasks.report({ task_id, status: 'working', summary: 'Got both.' })
+  s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.unread_followups, 0)
+  assert.equal(s.pending_followups.every((f) => f.acknowledged), true)
+})
+
+test('session_state is unknown unless a hook has set it explicitly, never inferred', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  let s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.session_state, 'unknown')
+  tasks.setSessionState(task_id, 'running_tool')
+  s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.session_state, 'running_tool')
+})
+
+test('classifier_outage is distinct from a stall and from a real denial', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'classifier_outage', summary: "Claude's permission classifier is temporarily unavailable." })
+  tasks.getTask(task_id).last_report_at = new Date(Date.now() - 60 * 60_000).toISOString()
+  const s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.status, 'classifier_outage')
+  assert.equal(s.stalled, undefined)
+  assert.equal(s.idle, undefined)
+  assert.match(await call(port, 'get_code_result', { task_id, wait_seconds: 0 }), /temporarily unavailable/)
+})
+
+test('project-gate holds and auto-mode fallback asks surface in status with full detail, answered by request_id', async (t) => {
+  const { port, tasks, channel } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'working', summary: 'Working.' })
+  const gate = tasks.registerGate({
+    request_id: 'gate-1',
+    kind: 'hold',
+    tool_name: 'Bash',
+    command: 'git push --force origin main',
+    description: 'a force-push or history rewrite: git push --force origin main',
+    repo: '/repo/path',
+    agent: 'main',
+    task_id,
+  })
+  assert.equal(gate.status, 'pending')
+  const s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.pending_gates.length, 1)
+  assert.equal(s.pending_gates[0].request_id, 'gate-1')
+  assert.equal(s.pending_gates[0].repo, '/repo/path')
+  assert.match(s.action, /force-push or history rewrite/)
+  assert.match(await call(port, 'get_code_result', { task_id, wait_seconds: 0 }), /answer_code_permission with request_id gate-1/)
+
+  const answered = await call(port, 'answer_code_permission', { request_id: 'gate-1', decision: 'deny' })
+  assert.match(answered, /Sent deny/)
+  assert.equal(tasks.getGate('gate-1').status, 'deny')
+  const after = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(after.pending_gates, undefined)
+
+  // Unknown/already-answered request_id errors instead of silently allowing.
+  const res = await post(port, `/mcp/${SECRET}`, {
+    jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'answer_code_permission', arguments: { request_id: 'gate-1', decision: 'allow' } },
+  })
+  const json = await res.json()
+  assert.equal(json.result.isError, true)
+})
+
+test('gate HTTP endpoint: register then poll reflects the answered decision', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const reg = await post(port, `/gate/${SECRET}`, { action: 'register', kind: 'ask', tool_name: 'Bash', command: 'npm test', repo: '/repo', agent: 'sub-1' })
+  assert.equal(reg.status, 200)
+  const { request_id } = await reg.json()
+  assert.ok(request_id)
+  let poll = await post(port, `/gate/${SECRET}`, { action: 'poll', request_id })
+  assert.equal((await poll.json()).status, 'pending')
+  tasks.answerGate(request_id, 'allow')
+  poll = await post(port, `/gate/${SECRET}`, { action: 'poll', request_id })
+  assert.equal((await poll.json()).status, 'allow')
+})
+
+test('gate endpoint 404s without the right secret', async (t) => {
+  const { port } = await withServer(t)
+  const res = await post(port, '/gate/wrong-secret', { action: 'register' })
+  assert.equal(res.status, 404)
 })

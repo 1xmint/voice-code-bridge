@@ -127,6 +127,108 @@ plugins you already use in that Claude Code session (for example,
 `orchestrate`) load exactly as they normally would — the bridge is just
 another MCP server in the mix, not a wrapper around your session.
 
+## Agent tree: seeing sub-agents, not just "working"
+
+Voice mode used to see one flat status per task: "working". It had no idea
+Claude Code had spawned three sub-agents, what each was doing, or which one
+was stuck. `agent_tree` fixes that from **real events, not self-reports**.
+
+### Design choice: hooks, not transcript tailing
+
+Two sources exist on disk for this:
+
+- **Session transcripts**, `~/.claude/projects/<proj>/<session>.jsonl`, with
+  each spawned sub-agent's own transcript alongside it at
+  `<proj>/<session>/subagents/agent-<agentId>.jsonl`, plus a sidecar
+  `agent-<agentId>.meta.json` (observed on disk to contain `agentType`,
+  `description`, `toolUseId`, `spawnDepth`).
+- **Hooks**: `SubagentStart`/`SubagentStop` and `PreToolUse`/`PostToolUse`
+  fire synchronously as Claude Code runs, and (per
+  `code.claude.com/docs/en/hooks`) already carry `agent_id`, `agent_type`,
+  `session_id`, `cwd`, `tool_name`, `tool_input`, and `transcript_path` on
+  stdin — Claude Code assigns the identity, we don't have to infer it.
+
+**Hooks are the primary source.** They give real-time, ready-made subagent
+identity and exact timing ("this tool call started 12s ago") for free.
+Transcripts are written on the CLI's own schedule, require tailing and
+parsing nested JSON, and carry no equivalent of "still running right now" —
+you'd have to infer liveness by watching a file stop growing. The one thing
+transcripts have that hooks don't (per the documented hook fields) is a
+sub-agent's **description**, which lives only in that `meta.json` sidecar.
+So `src/events.mjs` reads events from the hook log as the source of truth
+for identity/current-step/timing, and opportunistically reads the sidecar
+`meta.json` (derived from `transcript_path`, best-effort, never required)
+purely to enrich a node with the goal Claude Code gave that sub-agent.
+
+### How it works
+
+1. `scripts/agent-tree-hook.mjs` is a small, dependency-free Node script.
+   Claude Code runs it once per hook event and hands it JSON on stdin; it
+   appends one line to `~/.voice-code-bridge/events.jsonl` and always exits
+   0 (a logging failure must never slow down or block a Claude Code turn).
+2. `src/events.mjs`'s `buildAgentTree()` reads that log (bounded to the last
+   5000 lines) and folds it into one entry per session: the main agent plus
+   every sub-agent it spawned, each summarized with `current_tool`,
+   `time_on_step_s`, `last_activity_s`, `state`
+   (`running`/`blocked`/`done`), a 5-entry rolling action log, and — for the
+   session as a whole — `waiting_on`, the sub-agents still running or
+   blocked.
+3. The `agent_tree` MCP tool (in `src/http.mjs`) calls `buildAgentTree()` and
+   returns the whole tree as JSON in one call — cheap, since it's a single
+   bounded file read, no polling of Claude Code itself.
+
+### Hook configuration (add this yourself to `settings.json`)
+
+This bridge does not, and will not, edit your `~/.claude/settings.json`.
+Add this snippet yourself (merge with any hooks you already have), pointing
+`command` at your actual path to `scripts/agent-tree-hook.mjs`:
+
+```json
+{
+  "hooks": {
+    "SubagentStart": [
+      { "hooks": [{ "type": "command", "command": "node \"C:/path/to/voice-code-bridge/scripts/agent-tree-hook.mjs\"" }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "command": "node \"C:/path/to/voice-code-bridge/scripts/agent-tree-hook.mjs\"" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "node \"C:/path/to/voice-code-bridge/scripts/agent-tree-hook.mjs\"" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "node \"C:/path/to/voice-code-bridge/scripts/agent-tree-hook.mjs\"" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "node \"C:/path/to/voice-code-bridge/scripts/agent-tree-hook.mjs\"" }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "node \"C:/path/to/voice-code-bridge/scripts/agent-tree-hook.mjs\"" }] }
+    ]
+  }
+}
+```
+
+Without this configured, `agent_tree` returns "No agent activity recorded
+yet" rather than an error.
+
+### Cross-session relay log
+
+Every message this bridge actually relays — an instruction sent to Code, a
+progress report back, a permission request/verdict, a cancel — is appended
+to `~/.voice-code-bridge/relays.jsonl` (timestamp, from, to, kind, task_id,
+a ~200-char preview), and readable through the `list_relays` tool, filtered
+by `task_id`.
+
+**What this can't see:** this bridge is a stdio channel to exactly one
+Claude Code process plus one HTTP endpoint for voice. It has no visibility
+into peer-to-peer `SendMessage` traffic between *separate* Claude Code
+sessions or sub-agents (an agent-teams feature) — that never touches this
+process. The only way to capture that would be a hook on whatever tool
+agent-teams messaging uses internally (if it fires `PreToolUse`/
+`PostToolUse` like any other tool call, `agent-tree-hook.mjs` would already
+log it under that tool's name — this hasn't been confirmed against a real
+agent-teams session).
+
 ## Development
 
 ```
