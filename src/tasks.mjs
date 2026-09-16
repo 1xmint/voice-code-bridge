@@ -41,7 +41,7 @@ export class TaskStore {
   // owned them died with the old process, so they can no longer be answered.
   // Tasks that were still in flight get a restart_note so voice hears that
   // Code may have lost them, instead of waiting on a silent task.
-  load() {
+  load({ keepPending = false } = {}) {
     if (!this.jsonlPath || !fs.existsSync(this.jsonlPath)) return 0
     let lines
     try {
@@ -60,7 +60,8 @@ export class TaskStore {
       this._replay(r)
     }
     for (const task of this.tasks.values()) {
-      if (task.pendingPermission) {
+      // A worker restarted by the doorway keeps them: Code's prompt is still open.
+      if (task.pendingPermission && !keepPending) {
         task.status = task.priorStatus || 'working'
         task.pendingPermission = null
       }
