@@ -24,6 +24,10 @@ Steer toward the user's vision for the project. You may decide:
 - Deploying to a live server
 - Any change of project direction
 
+## Tests run on GitHub, for all projects
+
+Tests run on GitHub (Actions CI), never as full suites on the local PC. A merge waits for CI to pass. Where the code runs on Windows, CI runs on Windows too. (Standing rule from the user, 2026-09-16.)
+
 ## Check what already exists first
 
 Before approving new tooling, dependencies or third-party services, check what
