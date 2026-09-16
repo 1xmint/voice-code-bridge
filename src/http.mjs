@@ -1,6 +1,8 @@
 // Public-facing HTTP MCP endpoint used by Claude voice mode. Stateless
 // Streamable-HTTP JSON responses, same shape proven against real voice mode
-// in docs/.proven-test-server.mjs. Only POST /mcp/<secret> is served.
+// in docs/.proven-test-server.mjs. Only POST /mcp/<secret> is served, plus
+// POST /gate/<secret> for the (not-yet-installed) project-gate and
+// permission-bridge hooks to register and poll held/asked actions.
 import http from 'node:http'
 import crypto from 'node:crypto'
 import path from 'node:path'
@@ -38,23 +40,49 @@ function speakableAge(iso) {
   return `${h} hour${h === 1 ? '' : 's'} ago`
 }
 
-const WAITING = ['needs_approval', 'needs_input']
+// needs_approval/needs_input: waiting on the user, the user is the blocker.
+// classifier_outage: Claude Code's own auto-mode classifier is temporarily
+// unavailable; Code is paused for a known, reported reason, not silently.
+// Neither is ever second-guessed by the idle/stalled timers below.
+const WAITING = ['needs_approval', 'needs_input', 'classifier_outage']
 const TERMINAL = ['done', 'failed', 'cancelled']
+
+// A task must never read as "working" on the strength of a stale claim
+// alone. No activity for VCB_IDLE_MINUTES: report idle. Longer
+// (VCB_STALL_MINUTES): report stalled, with the reason.
+function idleMinutes() {
+  const n = Number(process.env.VCB_IDLE_MINUTES)
+  return process.env.VCB_IDLE_MINUTES && Number.isFinite(n) && n > 0 ? n : 5
+}
 
 function stallMinutes() {
   const n = Number(process.env.VCB_STALL_MINUTES)
   return process.env.VCB_STALL_MINUTES && Number.isFinite(n) && n > 0 ? n : 10
 }
 
-// A spoken note when an in-flight task has gone quiet for too long, or null.
-// Tasks waiting on the user are not stalled: the user is the blocker.
-function stallNote(task) {
-  if (WAITING.includes(task.status) || TERMINAL.includes(task.status)) return null
-  const since = task.followup_pending_since || task.last_report_at || task.created_at
-  if (Date.now() - new Date(since).getTime() < stallMinutes() * 60_000) return null
-  if (task.followup_pending_since) return `Possibly stalled: a follow-up was sent ${speakableAge(since)} and Code has not acknowledged it.`
-  if (!task.last_report_at) return `Possibly stalled: Code has not acknowledged this task, sent ${speakableAge(since)}.`
-  return `Possibly stalled: no report from Code since ${speakableAge(since)}.`
+// Liveness for a task that claims to still be in flight. `since` is the
+// most specific signal available: an unacknowledged follow-up, then the
+// last recorded activity (a report today; a tool/output event from a hook,
+// once wired up), then the task's creation time. Returns tier: null | 'idle'
+// | 'stalled', and a spoken-friendly reason for the tier (or null).
+function liveness(task) {
+  if (WAITING.includes(task.status) || TERMINAL.includes(task.status)) return { tier: null, reason: null }
+  const since = task.followup_pending_since || task.last_activity_at || task.last_report_at || task.created_at
+  const ageMs = Date.now() - new Date(since).getTime()
+  if (ageMs >= stallMinutes() * 60_000) {
+    let reason
+    if (task.followup_pending_since) reason = `Possibly stalled: a follow-up was sent ${speakableAge(since)} and Code has not acknowledged it.`
+    else if (!task.last_report_at) reason = `Possibly stalled: Code has not acknowledged this task, sent ${speakableAge(since)}.`
+    else reason = `Possibly stalled: no report from Code since ${speakableAge(since)}.`
+    return { tier: 'stalled', reason }
+  }
+  if (ageMs >= idleMinutes() * 60_000) {
+    const reason = task.followup_pending_since
+      ? `Idle: a follow-up was sent ${speakableAge(since)} and Code has not acknowledged it yet.`
+      : `Idle: no activity from Code in ${speakableAge(since)}.`
+    return { tier: 'idle', reason }
+  }
+  return { tier: null, reason: null }
 }
 
 function resolveTaskId(tasks, args) {
@@ -63,17 +91,47 @@ function resolveTaskId(tasks, args) {
   return undefined
 }
 
-function describeStatus(task) {
+// Every pending follow-up for a task: when it was sent, its text, and
+// whether Code has acknowledged it (with a report) yet.
+function followupQueue(task) {
+  return (task.pendingFollowups || []).map((f) => ({ sent_at: f.sent_at, text: f.text, acknowledged: !!f.acknowledged }))
+}
+
+function pendingGatesFor(tasks, task) {
+  return tasks
+    .listPendingGates()
+    .filter((g) => g.task_id === task.task_id)
+    .map((g) => ({ request_id: g.request_id, kind: g.kind, tool_name: g.tool_name, command: g.command, repo: g.repo, agent: g.agent, description: g.description }))
+}
+
+function describeStatus(tasks, task) {
   if (!task) return null
-  const base = { task_id: task.task_id, status: task.status, updated_at: task.updated_at, age: speakableAge(task.updated_at) }
+  const live = liveness(task)
+  const base = {
+    task_id: task.task_id,
+    status: live.tier && task.status === 'working' ? live.tier : task.status,
+    updated_at: task.updated_at,
+    age: speakableAge(task.updated_at),
+  }
+  if (base.status !== task.status) base.raw_status = task.status
   if (task.name) base.name = task.name
   base.session = path.basename(process.cwd())
-  const stall = stallNote(task)
-  if (stall) base.stalled = stall
+  // Raw session state (idle / running_tool / awaiting_input) only if a hook
+  // has ever set it explicitly. Never guessed from timers.
+  base.session_state = task.session_state || 'unknown'
+  if (live.tier === 'stalled') base.stalled = live.reason
+  if (live.tier === 'idle') base.idle = live.reason
   if (task.last_report_at) base.last_report = speakableAge(task.last_report_at)
   if (task.followup_pending_since) {
     base.followup_pending = `A follow-up was sent ${speakableAge(task.followup_pending_since)} and Code has not acknowledged it yet.`
   }
+  const followups = followupQueue(task)
+  if (followups.length) {
+    base.pending_followups = followups
+    base.unread_followups = followups.filter((f) => !f.acknowledged).length
+  }
+  const gates = pendingGatesFor(tasks, task)
+  if (gates.length) base.pending_gates = gates
   if (task.reports.length > 1) {
     base.recent = task.reports.slice(-4, -1).map((r) => `${speakableAge(r.at)}: ${r.summary}`)
   }
@@ -90,13 +148,13 @@ function describeStatus(task) {
     base.approval = `Claude wants to use ${p.tool_name}: ${p.description}`
     if (p.input_preview) base.approval_details = p.input_preview
   }
-  const action = actionFor(task)
+  const action = actionFor(tasks, task)
   if (action) base.action = action
   return base
 }
 
 // One spoken sentence saying exactly what the user must do, or null.
-function actionFor(task) {
+function actionFor(tasks, task) {
   if (task.status === 'needs_approval' && task.pendingPermission) {
     const p = task.pendingPermission
     return `Code needs permission to use ${p.tool_name}: ${p.description}. Ask the user yes or no, then call answer_code_permission with request_id ${p.request_id}.`
@@ -105,14 +163,24 @@ function actionFor(task) {
     const q = latestReportText(task) || 'Code has a question.'
     return `Code is waiting on the user: ${q} Relay their answer with send_to_code using task_id ${task.task_id}.`
   }
+  if (task.status === 'classifier_outage') {
+    const q = latestReportText(task) || "Claude's permission classifier is temporarily unavailable."
+    return `Code is paused, not stalled: ${q} No action needed yet; check back shortly.`
+  }
+  const gate = pendingGatesFor(tasks, task)[0]
+  if (gate) {
+    const what = gate.description || gate.command || `use ${gate.tool_name}`
+    const label = gate.kind === 'hold' ? 'a gated action' : 'permission'
+    return `Code is holding on ${label} in ${gate.repo || 'its repo'}: ${what}. Ask the user yes or no, then call answer_code_permission with request_id ${gate.request_id}.`
+  }
   return null
 }
 
 // Prepended to every tool reply so a waiting task is heard whatever voice asks.
 function attentionBanner(tasks, exceptTaskId) {
-  const waiting = tasks.listRecent(20).filter((t) => t && t.task_id !== exceptTaskId && actionFor(t))
+  const waiting = tasks.listRecent(20).filter((t) => t && t.task_id !== exceptTaskId && actionFor(tasks, t))
   if (!waiting.length) return ''
-  return 'ATTENTION: ' + waiting.map(actionFor).join(' ') + '\n\n'
+  return 'ATTENTION: ' + waiting.map((t) => actionFor(tasks, t)).join(' ') + '\n\n'
 }
 
 function narrate(task) {
@@ -150,7 +218,8 @@ function toolsList() {
     },
     {
       name: 'get_code_status',
-      description: 'Check the status of a task sent to Code (queued, working, needs_approval, needs_input, done, failed, or cancelled) without waiting. A task needing the user carries an \"action\" field saying exactly what to ask and which tool to answer with. Omit task_id to check the most recent task, or to list recent tasks.',
+      description:
+        'Check the status of a task sent to Code (queued, working, idle, stalled, needs_approval, needs_input, classifier_outage, done, failed, or cancelled) without waiting. "idle"/"stalled" mean Code has gone quiet despite claiming to work -- status is never reported as "working" on trust alone. A task needing the user carries an "action" field saying exactly what to ask and which tool to answer with. Also lists every pending follow-up, its acknowledgement, and the raw session state if known. Omit task_id to check the most recent task, or to list recent tasks.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -173,11 +242,11 @@ function toolsList() {
     },
     {
       name: 'answer_code_permission',
-      description: 'Approve or deny a pending permission request from Code (shown as "needs approval" in status). Use when the user says yes/no, allow/deny, approve/reject to something Code wants to do.',
+      description: 'Approve or deny a pending permission request from Code, or a held action from the project-gate/permission-bridge hooks (both shown as "needs approval" or in pending_gates). Use when the user says yes/no, allow/deny, approve/reject to something Code wants to do.',
       inputSchema: {
         type: 'object',
         properties: {
-          request_id: { type: 'string', description: 'The request_id from the pending approval' },
+          request_id: { type: 'string', description: 'The request_id from the pending approval or held action' },
           decision: { type: 'string', enum: ['allow', 'deny'] },
         },
         required: ['request_id', 'decision'],
@@ -231,11 +300,11 @@ async function callTool(name, args, { tasks, channel }) {
     case 'get_code_status': {
       const task_id = resolveTaskId(tasks, args)
       if (task_id !== undefined) {
-        const status = task_id && describeStatus(tasks.getTask(task_id))
+        const status = task_id && describeStatus(tasks, tasks.getTask(task_id))
         if (!status) return { ...text(`No task ${args.task_id ? `with id ${args.task_id}` : `named ${args.name}`}.`), isError: true }
         return text(JSON.stringify(status))
       }
-      const recent = tasks.listRecent(5).map(describeStatus)
+      const recent = tasks.listRecent(5).map((t) => describeStatus(tasks, t))
       if (recent.length === 0) return text('No tasks sent to Code yet.')
       return text(JSON.stringify(recent))
     }
@@ -258,12 +327,12 @@ async function callTool(name, args, { tasks, channel }) {
         task = tasks.getTask(id) || task
         if (task.reports.length === before && task.status === beforeStatus) {
           const last = task.reports[task.reports.length - 1]
-          const stall = stallNote(task)
+          const live = liveness(task)
           const reply = last ? `No change yet. ${narrate(task)}` : `Code is still working: ${task.status}.`
-          return text(stall ? `${reply} ${stall}` : reply)
+          return text(live.reason ? `${reply} ${live.reason}` : reply)
         }
       }
-      if (actionFor(task)) return text(actionFor(task))
+      if (actionFor(tasks, task)) return text(actionFor(tasks, task))
       if (task.status === 'cancelled') return text('That task was cancelled.')
       return text(narrate(task))
     }
@@ -273,10 +342,17 @@ async function callTool(name, args, { tasks, channel }) {
         return { ...text('I need a request_id and a decision of allow or deny.'), isError: true }
       }
       const owner = tasks.listRecent(50).find((t) => t.pendingPermission?.request_id === request_id)
-      if (!owner) return { ...text('No pending approval with that id. It may have already been answered.'), isError: true }
-      channel.sendPermissionVerdict(request_id, decision)
-      tasks.clearPermissionRequest(owner.task_id, decision)
-      return text(`Sent ${decision}.`)
+      if (owner) {
+        channel.sendPermissionVerdict(request_id, decision)
+        tasks.clearPermissionRequest(owner.task_id, decision)
+        return text(`Sent ${decision}.`)
+      }
+      const gate = tasks.getGate(request_id)
+      if (gate && gate.status === 'pending') {
+        tasks.answerGate(request_id, decision)
+        return text(`Sent ${decision}.`)
+      }
+      return { ...text('No pending approval with that id. It may have already been answered.'), isError: true }
     }
     case 'cancel_code_task': {
       const { task_id } = args || {}
@@ -332,13 +408,44 @@ async function handleRpc(msg, ctx) {
   }
 }
 
+// POST /gate/<secret> body: { action: 'register'|'poll'|'status', ... }.
+// Used by hooks/project-gate.mjs (PreToolUse) and a future permission-bridge
+// hook (PermissionRequest), which run as short-lived child processes and so
+// poll rather than hold a channel connection open. Never exposed as an MCP
+// tool: voice mode answers gates through the existing answer_code_permission
+// tool by request_id, same as any other pending approval.
+async function handleGateRequest(body, tasks, log) {
+  let parsed
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return { statusCode: 400, body: null }
+  }
+  const { action } = parsed || {}
+  if (action === 'register') {
+    const { request_id, tool_name, description, input_preview, repo, agent, command, kind, task_id } = parsed
+    const gate = tasks.registerGate({ request_id, tool_name, description, input_preview, repo, agent, command, kind, task_id })
+    log?.(`gate registered ${gate.request_id} kind=${gate.kind} tool=${gate.tool_name} repo=${gate.repo}`)
+    return { statusCode: 200, body: { request_id: gate.request_id, task_id: gate.task_id } }
+  }
+  if (action === 'poll' || action === 'status') {
+    const gate = tasks.getGate(parsed.request_id)
+    if (!gate) return { statusCode: 404, body: { status: 'unknown' } }
+    return { statusCode: 200, body: { status: gate.status } }
+  }
+  return { statusCode: 400, body: { error: `unknown action ${action}` } }
+}
+
 export function createHttpServer({ secret, tasks, channel, log = () => {} }) {
-  const prefix = '/mcp/'
+  const mcpPrefix = '/mcp/'
+  const gatePrefix = '/gate/'
 
   return http.createServer(async (req, res) => {
     const url = req.url || ''
-    const provided = url.startsWith(prefix) ? url.slice(prefix.length) : ''
-    if (req.method !== 'POST' || !url.startsWith(prefix) || !constantTimeEqual(provided, secret)) {
+    const isMcp = url.startsWith(mcpPrefix)
+    const isGate = url.startsWith(gatePrefix)
+    const providedSecret = isMcp ? url.slice(mcpPrefix.length) : isGate ? url.slice(gatePrefix.length) : ''
+    if (req.method !== 'POST' || !(isMcp || isGate) || !constantTimeEqual(providedSecret, secret)) {
       res.writeHead(404).end()
       return
     }
@@ -354,6 +461,13 @@ export function createHttpServer({ secret, tasks, channel, log = () => {} }) {
     }
     if (tooLarge) {
       res.writeHead(413).end()
+      return
+    }
+
+    if (isGate) {
+      const { statusCode, body: replyBody } = await handleGateRequest(body, tasks, log)
+      res.writeHead(statusCode, { 'Content-Type': 'application/json' })
+      res.end(replyBody === null ? '' : JSON.stringify(replyBody))
       return
     }
 

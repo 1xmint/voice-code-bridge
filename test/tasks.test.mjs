@@ -82,3 +82,51 @@ test('getActiveTaskId prefers the most recent non-terminal task', () => {
   tasks.report({ task_id: b.task_id, status: 'done', summary: 'done' })
   assert.equal(tasks.getActiveTaskId(), a.task_id)
 })
+
+test('recordActivity updates last_activity_at with a rolling activity log', () => {
+  const tasks = new TaskStore({})
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  const before = tasks.getTask(task_id).last_activity_at
+  tasks.recordActivity(task_id, { source: 'tool', detail: 'Bash: ls' })
+  const task = tasks.getTask(task_id)
+  assert.ok(task.last_activity_at >= before)
+  assert.equal(task.activity.at(-1).source, 'tool')
+  assert.equal(task.activity.at(-1).detail, 'Bash: ls')
+})
+
+test('report() also records activity and acknowledges pending follow-ups', () => {
+  const tasks = new TaskStore({})
+  const { task_id } = tasks.createTask({ instruction: 'first' })
+  tasks.report({ task_id, status: 'working', summary: 'on it' })
+  tasks.createTask({ instruction: 'follow up 1', task_id })
+  tasks.createTask({ instruction: 'follow up 2', task_id })
+  let task = tasks.getTask(task_id)
+  assert.equal(task.pendingFollowups.length, 2)
+  assert.equal(task.pendingFollowups.every((f) => !f.acknowledged), true)
+  tasks.report({ task_id, status: 'working', summary: 'got both' })
+  task = tasks.getTask(task_id)
+  assert.equal(task.pendingFollowups.every((f) => f.acknowledged), true)
+  assert.equal(task.activity.at(-1).source, 'report')
+})
+
+test('setSessionState only accepts known states and defaults to null (unknown)', () => {
+  const tasks = new TaskStore({})
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  assert.equal(tasks.getTask(task_id).session_state, null)
+  tasks.setSessionState(task_id, 'awaiting_input')
+  assert.equal(tasks.getTask(task_id).session_state, 'awaiting_input')
+  assert.throws(() => tasks.setSessionState(task_id, 'napping'))
+})
+
+test('registerGate/answerGate: independent of a task pendingPermission slot, supports several at once', () => {
+  const tasks = new TaskStore({})
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  const g1 = tasks.registerGate({ request_id: 'g1', kind: 'hold', tool_name: 'Bash', command: 'git push --force', repo: '/r', agent: 'main', task_id })
+  const g2 = tasks.registerGate({ request_id: 'g2', kind: 'ask', tool_name: 'Bash', command: 'npm publish', repo: '/r', agent: 'sub-1', task_id })
+  assert.equal(tasks.listPendingGates().length, 2)
+  tasks.answerGate('g1', 'deny')
+  assert.equal(tasks.listPendingGates().length, 1)
+  assert.equal(tasks.getGate('g1').status, 'deny')
+  assert.equal(tasks.getGate('g2').status, 'pending')
+  assert.equal(tasks.answerGate('unknown-id', 'allow'), null)
+})

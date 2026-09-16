@@ -29,8 +29,8 @@ function toolsList() {
         type: 'object',
         properties: {
           task_id: { type: 'string', description: 'The task_id from the <channel> tag this report is for' },
-          status: { type: 'string', enum: ['working', 'done', 'failed', 'needs_input'] },
-          summary: { type: 'string', description: 'Short, speakable summary. No code blocks or file dumps. For needs_input, the exact question the user must answer.' },
+          status: { type: 'string', enum: ['working', 'done', 'failed', 'needs_input', 'classifier_outage'] },
+          summary: { type: 'string', description: 'Short, speakable summary. No code blocks or file dumps. For needs_input, the exact question the user must answer. For classifier_outage, say the auto-mode classifier is temporarily unavailable.' },
           now: { type: 'string', description: 'Optional: what you are doing right now, one short spoken sentence.' },
           next: { type: 'string', description: 'Optional: what you will do next, one short spoken sentence.' },
           detail: { type: 'string', description: 'Optional: fuller written detail (steps taken, tool running, findings). Shown in status, never read aloud.' },

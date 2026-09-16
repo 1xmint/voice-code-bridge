@@ -5,7 +5,15 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
 
-const STATUSES = ['queued', 'working', 'needs_approval', 'needs_input', 'done', 'failed', 'cancelled']
+// classifier_outage: Claude Code's auto-mode permission classifier is
+// temporarily unavailable, so Code is paused waiting to retry. Kept distinct
+// from a real deny (which just returns the task to its prior status) so it
+// never reads as a silent stall in status.
+const STATUSES = ['queued', 'working', 'needs_approval', 'needs_input', 'classifier_outage', 'done', 'failed', 'cancelled']
+
+// Raw session state, set only from an explicit signal (a hook event, once
+// wired up on feat/agent-tree) -- never inferred from timers or guesses.
+const SESSION_STATES = ['idle', 'running_tool', 'awaiting_input']
 
 function newTaskId() {
   return crypto.randomBytes(4).toString('hex')
@@ -17,6 +25,10 @@ export class TaskStore {
     this.tasks = new Map() // task_id -> task
     this.order = [] // task_ids in creation order
     this.idempotency = new Map() // request_id -> task_id
+    // Held/asked actions from the project-gate and permission-bridge hooks,
+    // keyed by request_id. Independent of tasks.pendingPermission (a single
+    // slot per task) so more than one hold can be outstanding at once.
+    this.gates = new Map()
     this.events = new EventEmitter()
     this.events.setMaxListeners(0)
   }
@@ -53,7 +65,11 @@ export class TaskStore {
         context: context || null,
         created_at: now,
         updated_at: now,
+        last_activity_at: now,
+        session_state: null,
         reports: [],
+        activity: [],
+        pendingFollowups: [],
         pendingPermission: null,
       }
       if (name) task.name = String(name).trim()
@@ -68,6 +84,8 @@ export class TaskStore {
       // clears it. Finished or waiting tasks do go back to queued.
       if (!['working', 'needs_approval'].includes(task.status)) task.status = 'queued'
       task.followup_pending_since = now
+      task.pendingFollowups = task.pendingFollowups || []
+      task.pendingFollowups.push({ sent_at: now, text: instruction, acknowledged: false })
       task.updated_at = now
     }
 
@@ -112,6 +130,34 @@ export class TaskStore {
       .map((id) => this.tasks.get(id))
   }
 
+  // Records that *something* happened on a task: a report, or (once hooked
+  // up on feat/agent-tree) a tool call or tool output event. This is the
+  // seam liveness checks read from -- report() calls it today; a future
+  // PreToolUse/PostToolUse hook can call it directly with source: 'tool'
+  // without going through report() at all.
+  recordActivity(taskId, { source = 'report', detail, at } = {}) {
+    const task = this.tasks.get(taskId)
+    if (!task) return
+    const ts = at || new Date().toISOString()
+    task.last_activity_at = ts
+    task.activity = task.activity || []
+    task.activity.push({ at: ts, source, detail })
+    if (task.activity.length > 20) task.activity.shift()
+    this._append({ event: 'activity', task_id: taskId, source, detail })
+  }
+
+  // Sets the raw session state from an explicit signal only (never a guess).
+  // state must be one of SESSION_STATES, or null to go back to unknown.
+  setSessionState(taskId, state) {
+    const task = this.tasks.get(taskId)
+    if (!task) return
+    if (state !== null && !SESSION_STATES.includes(state)) throw new Error(`invalid session_state: ${state}`)
+    task.session_state = state
+    task.updated_at = new Date().toISOString()
+    this._append({ event: 'session_state', task_id: taskId, state })
+    this.events.emit('update', taskId)
+  }
+
   // Called from the Code (stdio) side via the `report` tool.
   // needs_input stays distinct from needs_approval: a question for the user
   // has no request_id, so the voice side must answer it with send_to_code.
@@ -123,12 +169,19 @@ export class TaskStore {
     task.updated_at = new Date().toISOString()
     task.last_report_at = task.updated_at
     delete task.followup_pending_since
+    for (const f of task.pendingFollowups || []) {
+      if (!f.acknowledged) {
+        f.acknowledged = true
+        f.acknowledged_at = task.updated_at
+      }
+    }
     const entry = { at: task.updated_at, status, summary }
     if (now) entry.now = now
     if (next) entry.next = next
     if (detail) entry.detail = detail
     task.reports.push(entry)
     this._append({ event: 'report', ...entry, task_id })
+    this.recordActivity(task_id, { source: 'report', detail: summary, at: task.updated_at })
     this.events.emit('update', task_id)
     return task
   }
@@ -152,6 +205,53 @@ export class TaskStore {
     task.updated_at = new Date().toISOString()
     this._append({ event: 'permission_verdict', task_id: taskId, behavior })
     this.events.emit('update', taskId)
+  }
+
+  // Registers a held or ask-through action from a PreToolUse/PermissionRequest
+  // hook: kind 'hold' for a project-gate block (deploys, spending/signing,
+  // public posting, force-push/history-rewrite) that always waits for a human
+  // answer; kind 'ask' for an auto-mode fallback prompt passed through so
+  // voice can see and answer it. Independent of a single task's
+  // pendingPermission slot so more than one can be outstanding at once.
+  registerGate({ request_id, tool_name, description, input_preview, repo, agent, command, kind, task_id } = {}) {
+    const id = request_id || newTaskId()
+    const gate = {
+      request_id: id,
+      tool_name: tool_name || null,
+      description: description || null,
+      input_preview: input_preview || null,
+      repo: repo || null,
+      agent: agent || null,
+      command: command || null,
+      kind: kind === 'ask' ? 'ask' : 'hold',
+      status: 'pending',
+      task_id: task_id || this.getActiveTaskId() || null,
+      created_at: new Date().toISOString(),
+    }
+    this.gates.set(id, gate)
+    this._append({ event: 'gate_registered', request_id: id, tool_name: gate.tool_name, kind: gate.kind, repo: gate.repo, agent: gate.agent, command: gate.command })
+    this.events.emit('update', gate.task_id)
+    return gate
+  }
+
+  getGate(requestId) {
+    return this.gates.get(requestId) || null
+  }
+
+  listPendingGates() {
+    return [...this.gates.values()].filter((g) => g.status === 'pending')
+  }
+
+  // decision is 'allow' or 'deny'. Returns the updated gate, or null if
+  // request_id is unknown (already answered, expired, or never registered).
+  answerGate(requestId, decision) {
+    const gate = this.gates.get(requestId)
+    if (!gate) return null
+    gate.status = decision
+    gate.answered_at = new Date().toISOString()
+    this._append({ event: 'gate_answered', request_id: requestId, decision })
+    this.events.emit('update', gate.task_id)
+    return gate
   }
 
   cancel(taskId) {
