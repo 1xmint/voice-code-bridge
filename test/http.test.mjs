@@ -436,7 +436,7 @@ test('recordActivity keeps a task off the idle/stalled tiers without a report', 
   assert.equal(s.idle, undefined)
 })
 
-test('queue visibility: every pending follow-up, acknowledgement, and unread count', async (t) => {
+test('queue visibility: only unacknowledged follow-ups are listed, with an unread count', async (t) => {
   const { port, tasks } = await withServer(t)
   const { task_id } = tasks.createTask({ instruction: 'first' })
   tasks.report({ task_id, status: 'working', summary: 'Started.' })
@@ -449,15 +449,15 @@ test('queue visibility: every pending follow-up, acknowledgement, and unread cou
   assert.equal(s.unread_followups, 2)
   tasks.report({ task_id, status: 'working', summary: 'Got both.' })
   s = JSON.parse(await call(port, 'get_code_status', { task_id }))
-  assert.equal(s.unread_followups, 0)
-  assert.equal(s.pending_followups.every((f) => f.acknowledged), true)
+  assert.equal(s.unread_followups, undefined)
+  assert.equal(s.pending_followups, undefined)
 })
 
-test('session_state is unknown unless a hook has set it explicitly, never inferred', async (t) => {
+test('session_state is absent unless a hook has set it explicitly, never inferred', async (t) => {
   const { port, tasks } = await withServer(t)
   const { task_id } = tasks.createTask({ instruction: 'x' })
   let s = JSON.parse(await call(port, 'get_code_status', { task_id }))
-  assert.equal(s.session_state, 'unknown')
+  assert.equal(s.session_state, undefined)
   tasks.setSessionState(task_id, 'running_tool')
   s = JSON.parse(await call(port, 'get_code_status', { task_id }))
   assert.equal(s.session_state, 'running_tool')
@@ -528,4 +528,23 @@ test('gate endpoint 404s without the right secret', async (t) => {
   const { port } = await withServer(t)
   const res = await post(port, '/gate/wrong-secret', { action: 'register' })
   assert.equal(res.status, 404)
+})
+
+test('get_code_status includes running helpers from the agent tree', async (t) => {
+  const eventsPath = tempPath('events.jsonl')
+  const now = new Date().toISOString()
+  const ev = (o) => JSON.stringify({ at: now, session_id: 's1', cwd: 'C:/x', ...o })
+  fs.writeFileSync(eventsPath, [
+    ev({ event: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    ev({ event: 'SubagentStart', agent_id: 'a1', agent_type: 'orch-debugger' }),
+    ev({ event: 'PreToolUse', agent_id: 'a1', agent_type: 'orch-debugger', tool_name: 'Read', tool_input: { file_path: 'x.mjs' } }),
+  ].join(String.fromCharCode(10)) + String.fromCharCode(10))
+  t.after(() => fs.rmSync(eventsPath, { force: true }))
+  const { port, tasks } = await withServer(t, { eventsPath })
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  const s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.agents.length, 1)
+  assert.equal(s.agents[0].helpers.length, 1)
+  assert.equal(s.agents[0].helpers[0].who, 'orch-debugger')
+  assert.match(s.agents[0].helpers[0].step, /^Read/)
 })
