@@ -200,7 +200,11 @@ if (process.env.VCB_ACTIVE === '1') {
     up.on('error', () => { if (!res.headersSent) res.writeHead(503); res.end() })
     req.pipe(up)
   })
-  server.on('error', (e) => log(`port ${port} unavailable: ${e.code || e.message}`))
+  // An old bridge from before a reconnect can keep the port for a while; keep trying.
+  server.on('error', (e) => {
+    log(`port ${port} unavailable: ${e.code || e.message}; retrying in 2s`)
+    setTimeout(() => server.listen(port, '127.0.0.1'), 2000)
+  })
   server.listen(port, '127.0.0.1', () => log(`holding 127.0.0.1:${port}`))
 }
 
