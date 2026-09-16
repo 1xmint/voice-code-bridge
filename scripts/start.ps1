@@ -35,16 +35,29 @@ $printUrlOutput = & node (Join-Path $RepoRoot 'bin\voice-code-bridge.mjs') print
 $localUrl = ($printUrlOutput | Select-String -Pattern '^http://').ToString().Trim()
 Write-Host "Bridge secret path: $Home_\config.json"
 
-# --- Start the quick tunnel as a background process ---------------------
-if (Test-Path $TunnelLog) { Remove-Item $TunnelLog -Force }
-$tunnelProc = Start-Process -FilePath $CloudflaredExe `
-    -ArgumentList @('tunnel', '--url', "http://localhost:$Port") `
-    -RedirectStandardOutput $TunnelOut `
-    -RedirectStandardError $TunnelLog `
-    -PassThru -NoNewWindow
-
-Write-Host "Waiting for cloudflared to report a tunnel URL..."
+# --- Prefer a Tailscale Funnel (stable URL) if one serves our port -------
+# Set up once with: tailscale funnel --bg <port>. Tailscale keeps it across reboots.
 $tunnelUrl = $null
+$tunnelProc = $null
+try {
+    $funnel = (& tailscale funnel status 2>$null) -join "`n"
+    $m = [regex]::Match($funnel, 'https://[a-zA-Z0-9.-]+\.ts\.net')
+    if ($m.Success -and $funnel -match 'Funnel on' -and $funnel -match "127\.0\.0\.1:$Port") {
+        $tunnelUrl = $m.Value
+        Write-Host "Using Tailscale Funnel: $tunnelUrl"
+    }
+} catch { }
+
+# --- Otherwise start a quick tunnel as a background process --------------
+if (-not $tunnelUrl) {
+    if (Test-Path $TunnelLog) { Remove-Item $TunnelLog -Force }
+    $tunnelProc = Start-Process -FilePath $CloudflaredExe `
+        -ArgumentList @('tunnel', '--url', "http://localhost:$Port") `
+        -RedirectStandardOutput $TunnelOut `
+        -RedirectStandardError $TunnelLog `
+        -PassThru -NoNewWindow
+    Write-Host "Waiting for cloudflared to report a tunnel URL..."
+}
 $deadline = (Get-Date).AddSeconds(30)
 while (-not $tunnelUrl -and (Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
@@ -64,9 +77,11 @@ if (-not $tunnelUrl) {
     Write-Host "Connector URL (paste into your claude.ai custom connector):"
     Write-Host "  $connectorUrl"
     Write-Host ""
-    Write-Host "NOTE: this quick-tunnel URL changes every restart. Re-edit the connector"
-    Write-Host "each time you run this script until you switch to a named tunnel or Tailscale Funnel."
-    Write-Host ""
+    if ($tunnelProc) {
+        Write-Host "NOTE: this quick-tunnel URL changes every restart. Re-edit the connector"
+        Write-Host "each time, or set up a stable one once: tailscale funnel --bg $Port"
+        Write-Host ""
+    }
 }
 
 # --- Check whether the bridge is registered as an MCP server ------------
