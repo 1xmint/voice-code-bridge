@@ -192,6 +192,15 @@ function toolsList() {
         required: ['task_id'],
       },
     },
+    {
+      name: 'timing_probe',
+      description: 'Diagnostic only. Waits the given number of seconds, then replies with the word "lighthouse". Use ONLY when the user explicitly asks for the timing probe or timing test; never for real work.',
+      inputSchema: {
+        type: 'object',
+        properties: { seconds: { type: 'number', description: 'How long to wait, 0 to 95' } },
+        required: ['seconds'],
+      },
+    },
   ]
 }
 
@@ -276,6 +285,12 @@ async function callTool(name, args, { tasks, channel }) {
       channel?.sendCancelEvent({ task_id })
       return text(`Cancelled task ${task_id}.`)
     }
+    case 'timing_probe': {
+      // Kept under Cloudflare's 100 s origin limit so a quick tunnel doesn't confound the result.
+      const seconds = Math.min(Math.max(Number(args?.seconds) || 0, 0), 95)
+      await new Promise((r) => setTimeout(r, seconds * 1000))
+      return text(`Waited ${seconds} seconds. The word is lighthouse.`)
+    }
     default:
       throw new Error(`unknown tool ${name}`)
   }
@@ -352,6 +367,19 @@ export function createHttpServer({ secret, tasks, channel, log = () => {} }) {
 
     const batch = Array.isArray(parsed)
     const messages = batch ? parsed : [parsed]
+
+    // Record when a caller hangs up before we answer, so client time limits are measured, not guessed.
+    const calls = messages.filter((m) => m?.method === 'tools/call').map((m) => m.params?.name).join(',')
+    if (calls) {
+      const started = Date.now()
+      let answered = false
+      res.on('finish', () => { answered = true })
+      res.on('close', () => {
+        const secs = ((Date.now() - started) / 1000).toFixed(1)
+        log(answered ? `tools/call ${calls} delivered at ${secs}s` : `tools/call ${calls} CALLER HUNG UP after ${secs}s, before the answer`)
+      })
+    }
+
     let replies
     try {
       replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel, log })))).filter(Boolean)
