@@ -27,7 +27,9 @@ function toolsList() {
         properties: {
           task_id: { type: 'string', description: 'The task_id from the <channel> tag this report is for' },
           status: { type: 'string', enum: ['working', 'done', 'failed', 'needs_input'] },
-          summary: { type: 'string', description: 'Short, speakable summary. No code blocks or file dumps.' },
+          summary: { type: 'string', description: 'Short, speakable summary. No code blocks or file dumps. For needs_input, the exact question the user must answer.' },
+          now: { type: 'string', description: 'Optional: what you are doing right now, one short spoken sentence.' },
+          next: { type: 'string', description: 'Optional: what you will do next, one short spoken sentence.' },
         },
         required: ['task_id', 'status', 'summary'],
       },
@@ -127,8 +129,8 @@ export class Channel {
   async _callTool(id, params) {
     try {
       if (params?.name === 'report') {
-        const { task_id, status, summary } = params.arguments || {}
-        this.tasks.report({ task_id, status, summary })
+        const { task_id, status, summary, now, next } = params.arguments || {}
+        this.tasks.report({ task_id, status, summary, now, next })
         this._write({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ok' }] } })
         return
       }

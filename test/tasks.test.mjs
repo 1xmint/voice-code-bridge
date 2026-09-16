@@ -39,11 +39,12 @@ test('report transitions status and records the summary', () => {
   assert.equal(task.reports.at(-1).summary, 'all fixed')
 })
 
-test('report with needs_input maps to needs_approval status', () => {
+test('report with needs_input stays needs_input, keeps now/next', () => {
   const tasks = new TaskStore({})
   const { task_id } = tasks.createTask({ instruction: 'x' })
-  tasks.report({ task_id, status: 'needs_input', summary: 'which file?' })
-  assert.equal(tasks.getTask(task_id).status, 'needs_approval')
+  tasks.report({ task_id, status: 'needs_input', summary: 'which file?', now: 'reading', next: 'editing' })
+  assert.equal(tasks.getTask(task_id).status, 'needs_input')
+  assert.equal(tasks.getTask(task_id).reports.at(-1).next, 'editing')
 })
 
 test('permission request/verdict round trip restores prior status', () => {

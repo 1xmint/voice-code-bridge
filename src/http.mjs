@@ -28,14 +28,56 @@ function speakableAge(iso) {
   return `${h} hour${h === 1 ? '' : 's'} ago`
 }
 
+const WAITING = ['needs_approval', 'needs_input']
+const TERMINAL = ['done', 'failed', 'cancelled']
+
 function describeStatus(task) {
   if (!task) return null
   const base = { task_id: task.task_id, status: task.status, updated_at: task.updated_at, age: speakableAge(task.updated_at) }
-  if (task.status === 'needs_approval' && task.pendingPermission) {
-    base.approval = `Claude wants to use ${task.pendingPermission.tool_name}: ${task.pendingPermission.description}`
-    base.request_id = task.pendingPermission.request_id
+  const last = task.reports[task.reports.length - 1]
+  if (last) {
+    base.latest = last.summary
+    if (last.now) base.now = last.now
+    if (last.next) base.next = last.next
   }
+  if (task.status === 'needs_approval' && task.pendingPermission) {
+    const p = task.pendingPermission
+    base.request_id = p.request_id
+    base.approval = `Claude wants to use ${p.tool_name}: ${p.description}`
+    if (p.input_preview) base.approval_details = p.input_preview
+  }
+  const action = actionFor(task)
+  if (action) base.action = action
   return base
+}
+
+// One spoken sentence saying exactly what the user must do, or null.
+function actionFor(task) {
+  if (task.status === 'needs_approval' && task.pendingPermission) {
+    const p = task.pendingPermission
+    return `Code needs permission to use ${p.tool_name}: ${p.description}. Ask the user yes or no, then call answer_code_permission with request_id ${p.request_id}.`
+  }
+  if (task.status === 'needs_input') {
+    const q = latestReportText(task) || 'Code has a question.'
+    return `Code is waiting on the user: ${q} Relay their answer with send_to_code using task_id ${task.task_id}.`
+  }
+  return null
+}
+
+// Prepended to every tool reply so a waiting task is heard whatever voice asks.
+function attentionBanner(tasks, exceptTaskId) {
+  const waiting = tasks.listRecent(20).filter((t) => t && t.task_id !== exceptTaskId && actionFor(t))
+  if (!waiting.length) return ''
+  return 'ATTENTION: ' + waiting.map(actionFor).join(' ') + '\n\n'
+}
+
+function narrate(task) {
+  const last = task.reports[task.reports.length - 1]
+  if (!last) return `Code is still working: ${task.status}.`
+  const parts = [last.summary]
+  if (last.now) parts.push(`Now: ${last.now}`)
+  if (last.next) parts.push(`Next: ${last.next}`)
+  return parts.join(' ')
 }
 
 function latestReportText(task) {
@@ -63,7 +105,7 @@ function toolsList() {
     },
     {
       name: 'get_code_status',
-      description: 'Check the status of a task sent to Code (queued, working, needs approval, done, failed, or cancelled) without waiting for it to finish. Omit task_id to check the most recent task, or to list recent tasks.',
+      description: 'Check the status of a task sent to Code (queued, working, needs_approval, needs_input, done, failed, or cancelled) without waiting. A task needing the user carries an \"action\" field saying exactly what to ask and which tool to answer with. Omit task_id to check the most recent task, or to list recent tasks.',
       inputSchema: {
         type: 'object',
         properties: { task_id: { type: 'string', description: 'Optional: which task to check. Defaults to the most recent.' } },
@@ -71,7 +113,7 @@ function toolsList() {
     },
     {
       name: 'get_code_result',
-      description: 'Wait briefly for Code to finish or make progress on a task, then return its latest spoken report. Use this when the user is waiting to hear back, e.g. "what did Code find" or "is it done yet".',
+      description: 'Wait briefly for Code to finish or make progress on a task, then return its latest spoken report. Returns at once, with the exact question or approval to relay, if Code is waiting on the user. Use this when the user is waiting to hear back, e.g. "what did Code find" or "is it done yet".',
       inputSchema: {
         type: 'object',
         properties: {
@@ -139,27 +181,25 @@ async function callTool(name, args, { tasks, channel }) {
       return text(JSON.stringify(recent))
     }
     case 'get_code_result': {
-      const id = args?.task_id || tasks.getLatestTaskId()
+      const id = args?.task_id || tasks.getActiveTaskId()
       if (!id) return text('No tasks sent to Code yet.')
       let task = tasks.getTask(id)
       if (!task) return { ...text(`No task with id ${id}.`), isError: true }
       const waitSeconds = Math.min(Math.max(Number(args?.wait_seconds) || 15, 0), 25)
-      const isTerminal = ['done', 'failed', 'cancelled'].includes(task.status)
-      const hasReport = task.reports.length > 0
-      if (!isTerminal && waitSeconds > 0) {
+      // Waiting on the user or finished: answer at once, never long-poll.
+      if (!WAITING.includes(task.status) && !TERMINAL.includes(task.status) && waitSeconds > 0) {
         const before = task.reports.length
+        const beforeStatus = task.status
         await tasks.waitForUpdate(id, waitSeconds * 1000)
         task = tasks.getTask(id) || task
-        if (task.reports.length === before && !['done', 'failed', 'cancelled'].includes(task.status)) {
-          return text(`Code is still working: ${describeStatus(task).status}.`)
+        if (task.reports.length === before && task.status === beforeStatus) {
+          const last = task.reports[task.reports.length - 1]
+          return text(last ? `No change yet. ${narrate(task)}` : `Code is still working: ${task.status}.`)
         }
-      } else if (!hasReport && !isTerminal) {
-        return text('Code is still working: queued.')
       }
-      const report = latestReportText(task)
-      if (report) return text(report)
+      if (actionFor(task)) return text(actionFor(task))
       if (task.status === 'cancelled') return text('That task was cancelled.')
-      return text(`Code is still working: ${task.status}.`)
+      return text(narrate(task))
     }
     case 'answer_code_permission': {
       const { request_id, decision } = args || {}
@@ -204,6 +244,10 @@ async function handleRpc(msg, ctx) {
     case 'tools/call': {
       try {
         const result = await callTool(params.name, params.arguments, ctx)
+        const banner = attentionBanner(ctx.tasks, params.arguments?.task_id)
+        if (banner && params.name !== 'get_code_status' && result.content?.[0]?.type === 'text') {
+          result.content[0].text = banner + result.content[0].text
+        }
         return ok(result)
       } catch (e) {
         return ok({ content: [{ type: 'text', text: String(e.message) }], isError: true })

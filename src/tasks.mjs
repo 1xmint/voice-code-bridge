@@ -94,14 +94,19 @@ export class TaskStore {
   }
 
   // Called from the Code (stdio) side via the `report` tool.
-  report({ task_id, status, summary }) {
+  // needs_input stays distinct from needs_approval: a question for the user
+  // has no request_id, so the voice side must answer it with send_to_code.
+  report({ task_id, status, summary, now, next }) {
     if (!STATUSES.includes(status)) throw new Error(`invalid status: ${status}`)
     const task = this.tasks.get(task_id)
     if (!task) throw new Error(`unknown task_id: ${task_id}`)
-    task.status = status === 'needs_input' ? 'needs_approval' : status
+    task.status = status
     task.updated_at = new Date().toISOString()
-    task.reports.push({ at: task.updated_at, status, summary })
-    this._append({ event: 'report', task_id, status, summary })
+    const entry = { at: task.updated_at, status, summary }
+    if (now) entry.now = now
+    if (next) entry.next = next
+    task.reports.push(entry)
+    this._append({ event: 'report', ...entry, task_id })
     this.events.emit('update', task_id)
     return task
   }

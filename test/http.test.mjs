@@ -99,3 +99,34 @@ test('send_to_code returns an error when the stdio channel is not ready', async 
   const json = await res.json()
   assert.equal(json.result.isError, true)
 })
+
+async function call(port, name, args) {
+  const res = await post(port, `/mcp/${SECRET}`, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name, arguments: args } })
+  return (await res.json()).result.content[0].text
+}
+
+test('needs_input: result returns the question at once, other replies carry a banner', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.report({ task_id, status: 'needs_input', summary: 'Approve Funnel in your browser?', now: 'enabling funnel' })
+  const started = Date.now()
+  const result = await call(port, 'get_code_result', { task_id, wait_seconds: 20 })
+  assert.ok(Date.now() - started < 2000)
+  assert.match(result, /Approve Funnel in your browser\?/)
+  assert.match(result, /send_to_code/)
+  const status = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(status.status, 'needs_input')
+  assert.equal(status.now, 'enabling funnel')
+  const other = tasks.createTask({ instruction: 'y' }).task_id
+  assert.match(await call(port, 'get_code_result', { task_id: other, wait_seconds: 0 }), /^ATTENTION: .*Approve Funnel/)
+})
+
+test('permission request: status and result expose request_id and prompt text', async (t) => {
+  const { port, tasks } = await withServer(t)
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  tasks.setPermissionRequest(task_id, { request_id: 'abcde', tool_name: 'Bash', description: 'Turn on Tailscale Funnel', input_preview: 'tailscale funnel --bg 8790' })
+  const status = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(status.request_id, 'abcde')
+  assert.equal(status.approval_details, 'tailscale funnel --bg 8790')
+  assert.match(await call(port, 'get_code_result', { task_id }), /Turn on Tailscale Funnel.*request_id abcde/)
+})
