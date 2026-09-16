@@ -88,8 +88,19 @@ const GATE_PATTERNS = [
   },
 ]
 
+// Only what the shell will run counts: heredoc bodies and quoted strings are
+// data (a commit message or test text that mentions "git push --force" is not
+// a force-push). A command hidden inside quotes, like bash -c "git push -f",
+// is missed; the classifier and normal prompts still see those.
+export function stripData(command) {
+  let s = String(command || '')
+  s = s.replace(/<<-?\s*['"]?(\w+)['"]?[^\n]*\n[\s\S]*?\n\s*\1\s*(?=\n|$)/g, '<<heredoc')
+  s = s.replace(/'[^']*'/g, "''").replace(/"(?:[^"\\]|\\.)*"/g, '""')
+  return s
+}
+
 export function matchGate(command) {
-  const cmd = String(command || '')
+  const cmd = stripData(command)
   for (const { category, label, patterns } of GATE_PATTERNS) {
     for (const re of patterns) {
       if (re.test(cmd)) return { category, label }

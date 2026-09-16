@@ -5,6 +5,9 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
 
+// A gate hold older than this is past the hook's 25s wait (see listPendingGates).
+const GATE_TTL_MS = 30_000
+
 // classifier_outage: Claude Code's auto-mode permission classifier is
 // temporarily unavailable, so Code is paused waiting to retry. Kept distinct
 // from a real deny (which just returns the task to its prior status) so it
@@ -342,7 +345,13 @@ export class TaskStore {
     return this.gates.get(requestId) || null
   }
 
-  listPendingGates() {
+  // The hook stops waiting after 25s and hands the prompt back to the
+  // terminal, so a gate still pending after that is already decided
+  // elsewhere; showing it to voice would invite an answer nobody receives.
+  listPendingGates(now = Date.now()) {
+    for (const g of this.gates.values()) {
+      if (g.status === 'pending' && now - new Date(g.created_at).getTime() > GATE_TTL_MS) g.status = 'expired'
+    }
     return [...this.gates.values()].filter((g) => g.status === 'pending')
   }
 

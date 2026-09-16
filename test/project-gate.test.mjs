@@ -81,3 +81,21 @@ test('run as a script, the way Claude Code runs it, a held command with no bridg
   assert.equal(r.status, 0)
   assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'ask')
 })
+
+test('matchGate ignores gated words inside heredocs and quotes, but still holds the real command', () => {
+  const heredoc = ['cat >> notes.txt <<' + "'EOF'", 'git push --force origin main', 'EOF', 'git add notes.txt'].join(String.fromCharCode(10))
+  assert.equal(matchGate(heredoc), null)
+  assert.equal(matchGate('git commit -m "never git push --force here"'), null)
+  assert.equal(matchGate("echo 'git reset --hard'"), null)
+  assert.equal(matchGate('git push --force origin x').category, 'history_rewrite')
+  assert.equal(matchGate(heredoc + String.fromCharCode(10) + 'git push -f origin x').category, 'history_rewrite')
+})
+
+test('gate holds past the hook wait drop out of the pending list', async () => {
+  const { TaskStore } = await import('../src/tasks.mjs')
+  const store = new TaskStore({})
+  const g = store.registerGate({ command: 'git push --force' })
+  assert.equal(store.listPendingGates().length, 1)
+  assert.equal(store.listPendingGates(Date.now() + 31_000).length, 0)
+  assert.equal(store.getGate(g.request_id).status, 'expired')
+})
