@@ -9,7 +9,7 @@ import { EventEmitter } from 'node:events'
 // temporarily unavailable, so Code is paused waiting to retry. Kept distinct
 // from a real deny (which just returns the task to its prior status) so it
 // never reads as a silent stall in status.
-const STATUSES = ['queued', 'working', 'needs_approval', 'needs_input', 'classifier_outage', 'done', 'failed', 'cancelled']
+const STATUSES = ['queued', 'working', 'needs_approval', 'needs_input', 'classifier_outage', 'done', 'failed', 'cancelled', 'stale']
 
 // Raw session state, set only from an explicit signal (a hook event, once
 // wired up on feat/agent-tree) -- never inferred from timers or guesses.
@@ -63,6 +63,15 @@ export class TaskStore {
       if (task.pendingPermission) {
         task.status = task.priorStatus || 'working'
         task.pendingPermission = null
+      }
+      // Unfinished and untouched for a day: almost always from a dead session.
+      // Mark it stale so it stays out of status lists and attention alerts.
+      // Session of origin isn't recorded, so age is the only signal.
+      const ageMs = Date.now() - new Date(task.updated_at).getTime()
+      if (ageMs > 24 * 3600_000 && !['done', 'failed', 'cancelled'].includes(task.status)) {
+        task.stale_from = task.status
+        task.status = 'stale'
+        continue
       }
       // Only recent tasks: a note on a days-old abandoned question is noise.
       const recent = Date.now() - new Date(task.updated_at).getTime() < 12 * 3600_000
@@ -204,7 +213,7 @@ export class TaskStore {
   getActiveTaskId() {
     for (let i = this.order.length - 1; i >= 0; i--) {
       const t = this.tasks.get(this.order[i])
-      if (t && !['done', 'failed', 'cancelled'].includes(t.status)) return t.task_id
+      if (t && !['done', 'failed', 'cancelled', 'stale'].includes(t.status)) return t.task_id
     }
     return this.getLatestTaskId()
   }

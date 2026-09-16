@@ -72,3 +72,26 @@ test('load tolerates a missing file and corrupt lines', () => {
   assert.equal(s.getTask('aa').instruction, 'hi')
   fs.rmSync(jsonlPath, { force: true })
 })
+
+test('unfinished tasks untouched for over a day come back stale and raise no attention', () => {
+  const jsonlPath = tempLog()
+  const a = new TaskStore({ jsonlPath })
+  const old = a.createTask({ instruction: 'old' }).task_id
+  a.report({ task_id: old, status: 'needs_input', summary: 'Which one?' })
+  const fresh = a.createTask({ instruction: 'fresh' }).task_id
+  const lines = fs.readFileSync(jsonlPath, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => {
+    const r = JSON.parse(l)
+    if (r.task_id === old && r.at) r.at = new Date(Date.now() - 2 * 86400_000).toISOString()
+    return JSON.stringify(r)
+  })
+  fs.writeFileSync(jsonlPath, lines.join(String.fromCharCode(10)))
+
+  const b = new TaskStore({ jsonlPath })
+  b.load()
+  assert.equal(b.getTask(old).status, 'stale')
+  assert.equal(b.getTask(old).stale_from, 'needs_input')
+  assert.equal(b.getTask(old).restart_note, undefined)
+  assert.notEqual(b.getTask(fresh).status, 'stale')
+  assert.equal(b.getActiveTaskId(), fresh)
+  fs.rmSync(jsonlPath, { force: true })
+})
