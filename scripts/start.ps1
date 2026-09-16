@@ -16,6 +16,8 @@ $Port = if ($env:VCB_PORT) { $env:VCB_PORT } else { '8790' }
 $BinDir = Join-Path $Home_ 'bin'
 $CloudflaredExe = Join-Path $BinDir 'cloudflared-windows-amd64.exe'
 $TunnelLog = Join-Path $Home_ 'cloudflared.log'
+$TunnelOut = Join-Path $Home_ 'cloudflared.out.log'
+$ProjectDir = (Get-Location).Path
 
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
@@ -37,7 +39,7 @@ Write-Host "Bridge secret path: $Home_\config.json"
 if (Test-Path $TunnelLog) { Remove-Item $TunnelLog -Force }
 $tunnelProc = Start-Process -FilePath $CloudflaredExe `
     -ArgumentList @('tunnel', '--url', "http://localhost:$Port") `
-    -RedirectStandardOutput $TunnelLog `
+    -RedirectStandardOutput $TunnelOut `
     -RedirectStandardError $TunnelLog `
     -PassThru -NoNewWindow
 
@@ -79,17 +81,20 @@ try {
 if (-not $registered) {
     $binPath = Join-Path $RepoRoot 'bin\voice-code-bridge.mjs'
     Write-Host "voice-bridge is not registered with Claude Code yet. Register it with:"
-    Write-Host "  claude mcp add voice-bridge -- node `"$binPath`""
+    Write-Host "  claude mcp add --scope user voice-bridge -- node `"$binPath`""
     Write-Host "Then re-run this script."
     Write-Host ""
 }
 
 # --- Launch Claude Code with the channel enabled -------------------------
-Push-Location $RepoRoot
+# Runs in the directory you started the script from (your project).
+# VCB_ACTIVE tells the bridge in THIS session to open the voice endpoint.
+Write-Host "Launching Claude Code in $ProjectDir"
+$env:VCB_ACTIVE = '1'
 try {
     & claude --dangerously-load-development-channels server:voice-bridge --remote-control
 } finally {
-    Pop-Location
+    Remove-Item Env:VCB_ACTIVE -ErrorAction SilentlyContinue
     if ($tunnelProc -and -not $tunnelProc.HasExited) {
         Write-Host "Stopping cloudflared tunnel..."
         Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue

@@ -69,7 +69,7 @@ test('full loop: stdio channel + http voice endpoint', async (t) => {
   const port = await freePort()
 
   const child = spawn(process.execPath, [BIN], {
-    env: { ...process.env, VCB_HOME: home, VCB_PORT: String(port) },
+    env: { ...process.env, VCB_HOME: home, VCB_PORT: String(port), VCB_ACTIVE: "1" },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   let stderr = ''

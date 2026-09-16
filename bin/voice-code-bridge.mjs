@@ -35,9 +35,20 @@ async function main() {
   const server = createHttpServer({ secret: config.secret, tasks, channel, log })
   const port = getPort()
 
-  server.listen(port, '127.0.0.1', () => {
-    log(`http mcp endpoint listening on 127.0.0.1:${port}`)
-  })
+  // The bridge is registered for every Claude Code session, but only the
+  // session launched by scripts/start.ps1 (VCB_ACTIVE=1) should own the
+  // public endpoint. Other sessions stay a quiet stdio server.
+  if (process.env.VCB_ACTIVE !== '1') {
+    log('VCB_ACTIVE is not 1: HTTP endpoint not started in this session')
+  } else {
+    server.on('error', (e) => {
+      log(`http endpoint failed to start on port ${port}: ${e.code || e.message}`)
+      process.stderr.write(`voice-code-bridge: port ${port} unavailable (${e.code || e.message}); is another bridge session running?\n`)
+    })
+    server.listen(port, '127.0.0.1', () => {
+      log(`http mcp endpoint listening on 127.0.0.1:${port}`)
+    })
+  }
 
   process.on('SIGINT', () => process.exit(0))
   process.on('SIGTERM', () => process.exit(0))
