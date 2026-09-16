@@ -52,7 +52,7 @@ function speakableAge(iso) {
 // unavailable; Code is paused for a known, reported reason, not silently.
 // Neither is ever second-guessed by the idle/stalled timers below.
 const WAITING = ['needs_approval', 'needs_input', 'classifier_outage']
-const TERMINAL = ['done', 'failed', 'cancelled']
+const TERMINAL = ['done', 'failed', 'cancelled', 'stale']
 
 // A task must never read as "working" on the strength of a stale claim
 // alone. No activity for VCB_IDLE_MINUTES: report idle. Longer
@@ -435,7 +435,7 @@ async function callTool(name, args, { tasks, channel, decisions, eventsPath, rel
         if (agents) status.agents = agents
         return text(JSON.stringify(status))
       }
-      const recent = tasks.listRecent(5).map((t) => describeStatus(tasks, t))
+      const recent = tasks.listRecent(20).filter((t) => t.status !== 'stale').slice(0, 5).map((t) => describeStatus(tasks, t))
       if (recent.length === 0) return text('No tasks sent to Code yet.')
       const agents = agentsSummary(eventsPath)
       return text(JSON.stringify(agents ? { agents, tasks: recent } : recent))
@@ -528,7 +528,7 @@ async function callTool(name, args, { tasks, channel, decisions, eventsPath, rel
       return text(JSON.stringify(list))
     }
     case 'status_all': {
-      const list = tasks.listAll().map((t) => describeStatusAll(t, decisions))
+      const list = tasks.listAll().filter((t) => t.status !== 'stale').map((t) => describeStatusAll(t, decisions))
       if (!list.length) return text(`No tasks yet. Bridge started at ${tasks.startedAt}.`)
       return text(JSON.stringify(list))
     }
