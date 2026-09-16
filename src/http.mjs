@@ -117,6 +117,7 @@ function describeStatus(tasks, task) {
   const base = {
     task_id: task.task_id,
     status: live.tier && task.status === 'working' ? live.tier : task.status,
+    ...(task.restart_note ? { restart_note: task.restart_note } : {}),
     updated_at: task.updated_at,
     age: speakableAge(task.updated_at),
   }
@@ -223,6 +224,7 @@ function lastDecisionFor(decisions, task) {
 function describeStatusAll(task, decisions) {
   const out = { task_id: task.task_id, status: task.status, session: path.basename(process.cwd()) }
   if (task.name) out.name = task.name
+  if (task.restart_note) out.restart_note = task.restart_note
   const summary = latestReportText(task)
   if (summary) out.summary = summary
   if (task.last_report_at) out.last_report_age = speakableAge(task.last_report_at)
@@ -494,7 +496,7 @@ async function callTool(name, args, { tasks, channel, decisions, eventsPath, rel
     }
     case 'status_all': {
       const list = tasks.listAll().map((t) => describeStatusAll(t, decisions))
-      if (!list.length) return text('No tasks yet.')
+      if (!list.length) return text(`No tasks yet. Bridge started at ${tasks.startedAt}.`)
       return text(JSON.stringify(list))
     }
     default:

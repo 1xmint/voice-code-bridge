@@ -31,6 +31,92 @@ export class TaskStore {
     this.gates = new Map()
     this.events = new EventEmitter()
     this.events.setMaxListeners(0)
+    this.startedAt = new Date().toISOString()
+    this.restoredCount = 0
+  }
+
+  // Rebuilds tasks from the JSONL log so a bridge restart (which happens every
+  // time Claude Code restarts or reconnects this server) doesn't wipe the list.
+  // Pending permission prompts are not restored: the Code-side request that
+  // owned them died with the old process, so they can no longer be answered.
+  // Tasks that were still in flight get a restart_note so voice hears that
+  // Code may have lost them, instead of waiting on a silent task.
+  load() {
+    if (!this.jsonlPath || !fs.existsSync(this.jsonlPath)) return 0
+    let lines
+    try {
+      lines = fs.readFileSync(this.jsonlPath, 'utf8').split(/\r?\n/)
+    } catch {
+      return 0
+    }
+    for (const line of lines) {
+      if (!line.trim()) continue
+      let r
+      try {
+        r = JSON.parse(line)
+      } catch {
+        continue
+      }
+      this._replay(r)
+    }
+    for (const task of this.tasks.values()) {
+      if (task.pendingPermission) {
+        task.status = task.priorStatus || 'working'
+        task.pendingPermission = null
+      }
+      // Only recent tasks: a note on a days-old abandoned question is noise.
+      const recent = Date.now() - new Date(task.updated_at).getTime() < 12 * 3600_000
+      if (recent && !['done', 'failed', 'cancelled'].includes(task.status)) {
+        task.restart_note = `The bridge restarted at ${this.startedAt} while this task was ${task.status}. Code may have lost it; resend it if it still matters.`
+      }
+    }
+    this.restoredCount = this.tasks.size
+    return this.restoredCount
+  }
+
+  _replay(r) {
+    const at = r.at || this.startedAt
+    const task = r.task_id ? this.tasks.get(r.task_id) : null
+    switch (r.event) {
+      case 'task_created': {
+        if (!task) {
+          const t = { task_id: r.task_id, status: 'queued', instruction: r.instruction, context: r.context || null, created_at: at, updated_at: at, last_activity_at: at, session_state: null, reports: [], activity: [], pendingFollowups: [], pendingPermission: null }
+          if (r.name) t.name = r.name
+          this.tasks.set(r.task_id, t)
+          this.order.push(r.task_id)
+        } else {
+          task.instruction = r.instruction
+          if (!['working', 'needs_approval'].includes(task.status)) task.status = 'queued'
+          task.followup_pending_since = at
+          task.pendingFollowups.push({ sent_at: at, text: r.instruction, acknowledged: false })
+          task.updated_at = at
+        }
+        return
+      }
+      case 'report': {
+        if (!task || !STATUSES.includes(r.status)) return
+        task.status = r.status
+        task.updated_at = task.last_report_at = task.last_activity_at = at
+        delete task.followup_pending_since
+        for (const f of task.pendingFollowups) if (!f.acknowledged) Object.assign(f, { acknowledged: true, acknowledged_at: at })
+        const entry = { at, status: r.status, summary: r.summary }
+        for (const k of ['now', 'next', 'detail']) if (r[k]) entry[k] = r[k]
+        task.reports.push(entry)
+        return
+      }
+      case 'activity':
+        if (task) task.last_activity_at = at
+        return
+      case 'permission_request':
+        if (task) Object.assign(task, { priorStatus: task.status, status: 'needs_approval', pendingPermission: { request_id: r.request_id }, updated_at: at })
+        return
+      case 'permission_verdict':
+        if (task) Object.assign(task, { status: task.priorStatus || 'working', pendingPermission: null, updated_at: at })
+        return
+      case 'cancelled':
+        if (task) Object.assign(task, { status: 'cancelled', updated_at: at })
+        return
+    }
   }
 
   _append(record) {
@@ -49,7 +135,7 @@ export class TaskStore {
       const existingId = this.idempotency.get(request_id)
       return { task_id: existingId, task: this.tasks.get(existingId), duplicate: true }
     }
-    // A known name with no task_id continues that task ("check realorrug").
+    // A known name with no task_id continues that task ('check realorrug').
     if (!task_id && name) task_id = this.findByName(name)?.task_id
 
     const kind = task_id && this.tasks.has(task_id) ? 'followup' : 'new'
@@ -79,7 +165,7 @@ export class TaskStore {
       task.instruction = instruction
       task.context = context || task.context
       // A follow-up to a task Code is still working on must not flip it back
-      // to "queued": the session keeps working and voice would hear it as
+      // to 'queued': the session keeps working and voice would hear it as
       // stuck. Mark the follow-up unacknowledged instead; the next report
       // clears it. Finished or waiting tasks do go back to queued.
       if (!['working', 'needs_approval'].includes(task.status)) task.status = 'queued'
@@ -173,6 +259,7 @@ export class TaskStore {
     const task = this.tasks.get(task_id)
     if (!task) throw new Error(`unknown task_id: ${task_id}`)
     task.status = status
+    delete task.restart_note
     task.updated_at = new Date().toISOString()
     task.last_report_at = task.updated_at
     delete task.followup_pending_since
