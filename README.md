@@ -15,7 +15,8 @@ terminal running Claude Code. It does two things at once:
 - It's a small public **HTTP MCP endpoint**, reachable through a tunnel, that
   you register as a custom connector in claude.ai. Voice mode calls tools on
   it: `send_to_code`, `get_code_status`, `get_code_result`,
-  `answer_code_permission`, `cancel_code_task`.
+  `answer_code_permission`, `cancel_code_task`, `log_decision`,
+  `list_decisions`, `status_all`.
 
 So the loop is: you talk to Claude on your phone → Claude calls
 `send_to_code` → the bridge hands the instruction to your Claude Code
@@ -85,10 +86,27 @@ Tailscale Funnel, either of which would let the connector URL stay fixed.
   directory with the `VCB_HOME` environment variable). It's never logged.
 - Secret comparison is constant-time.
 - Request bodies are capped in size.
-- Logs (`bridge.log`) and the task history (`tasks.jsonl`) also live under
-  that same directory, not in the repo.
+- Logs (`bridge.log`), the task history (`tasks.jsonl`), and the decision
+  log (`decisions.jsonl`) also live under that same directory, not in the
+  repo.
 - Treat the connector URL like a password: anyone who has it can push tasks
   into your Claude Code session and approve or deny tool use on your behalf.
+
+## Decision log and status_all
+
+While delegated (see `DELEGATION.md`), the voice assistant logs notable
+decisions with `log_decision` (`task_id` or `name`, `decision`, `reason`,
+`category`) and can read them back with `list_decisions`, optionally
+filtered to one task. Records append to
+`~/.voice-code-bridge/decisions.jsonl` (same `VCB_HOME` override as other
+state), one JSON object per line, and are never deleted from there
+automatically.
+
+`status_all` returns one compact snapshot of every task currently tracked:
+name/id, status, session, spoken summary, age of the last report, a stalled
+flag and reason when one applies, the pending question for a task waiting on
+the user, and the last logged decision for that task. Use it for "what's
+going on" across everything, instead of checking each task one at a time.
 
 ## How this relates to Claude Code channels and the dev flag
 
