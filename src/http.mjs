@@ -4,6 +4,7 @@
 import http from 'node:http'
 import crypto from 'node:crypto'
 import path from 'node:path'
+import { DecisionLog } from './decisions.mjs'
 
 const MAX_BODY_BYTES = 1_000_000
 
@@ -134,6 +135,40 @@ function latestReportText(task) {
   return last ? last.summary : null
 }
 
+// One line summarizing a logged decision, for embedding in a compact reply.
+function decisionSummary(d) {
+  if (!d) return null
+  return d.reason ? `${d.decision} (${d.reason})` : d.decision
+}
+
+function lastDecisionFor(decisions, task) {
+  if (!decisions) return null
+  let d = task.task_id ? decisions.lastForTask(task.task_id) : null
+  if (!d && task.name) d = decisions.listRecent({ name: task.name, limit: 1 })[0] || null
+  return d
+}
+
+// Compact per-task snapshot for status_all: enough to speak in one sentence,
+// not the full detail get_code_status gives for a single task.
+function describeStatusAll(task, decisions) {
+  const out = { task_id: task.task_id, status: task.status, session: path.basename(process.cwd()) }
+  if (task.name) out.name = task.name
+  const summary = latestReportText(task)
+  if (summary) out.summary = summary
+  if (task.last_report_at) out.last_report_age = speakableAge(task.last_report_at)
+  const stall = stallNote(task)
+  if (stall) {
+    out.stalled = true
+    out.stalled_reason = stall
+  }
+  if (task.status === 'needs_input') {
+    out.question = latestReportText(task) || 'Code has a question.'
+  }
+  const decision = lastDecisionFor(decisions, task)
+  if (decision) out.last_decision = decisionSummary(decision)
+  return out
+}
+
 function toolsList() {
   return [
     {
@@ -204,6 +239,40 @@ function toolsList() {
         properties: { seconds: { type: 'number', description: 'How long to wait, 0 to 95' } },
         required: ['seconds'],
       },
+    },
+    {
+      name: 'log_decision',
+      description:
+        'Record a decision made on the user\'s behalf while delegated (see DELEGATION.md) -- a routine call under "you may decide alone" worth remembering, not every trivial one. Attach it to a task with task_id or name when one applies.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'Optional: the task this decision belongs to' },
+          name: { type: 'string', description: 'Optional: the task\'s spoken name, instead of task_id' },
+          decision: { type: 'string', description: 'What was decided, in plain language' },
+          reason: { type: 'string', description: 'Optional: why' },
+          category: { type: 'string', description: 'Optional short label, e.g. pre-approved, retry, equivalent-approaches' },
+        },
+        required: ['decision'],
+      },
+    },
+    {
+      name: 'list_decisions',
+      description: 'Read back recently logged decisions, optionally filtered to one task by task_id or name. Use to answer "what did you decide" or "why did you do that".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'Optional: only decisions for this task' },
+          name: { type: 'string', description: 'Optional: only decisions for the task with this spoken name' },
+          limit: { type: 'number', description: 'Max number of decisions to return. Default 20.' },
+        },
+      },
+    },
+    {
+      name: 'status_all',
+      description:
+        'One compact snapshot of every task Code is tracking: name/id, status, session, spoken summary, age of the last report, a stalled flag and reason when one applies, the pending question for a task waiting on the user, and the last logged decision. Use for "what\'s going on" across everything, not just one task.',
+      inputSchema: { type: 'object', properties: {} },
     },
   ]
 }
@@ -295,6 +364,26 @@ async function callTool(name, args, { tasks, channel, decisions }) {
       await new Promise((r) => setTimeout(r, seconds * 1000))
       return text(`Waited ${seconds} seconds. The word is lighthouse.`)
     }
+    case 'log_decision': {
+      const { task_id, name, decision, reason, category } = args || {}
+      if (!decision || !String(decision).trim()) {
+        return { ...text('I need a decision to log.'), isError: true }
+      }
+      const resolvedId = task_id || tasks.findByName(name)?.task_id || null
+      const record = decisions.log({ task_id: resolvedId, name, decision, reason, category })
+      return text(`Logged: ${record.decision}.`)
+    }
+    case 'list_decisions': {
+      const { task_id, name, limit } = args || {}
+      const list = decisions.listRecent({ task_id, name, limit: limit ? Number(limit) : undefined })
+      if (!list.length) return text('No decisions logged yet.')
+      return text(JSON.stringify(list))
+    }
+    case 'status_all': {
+      const list = tasks.listAll().map((t) => describeStatusAll(t, decisions))
+      if (!list.length) return text('No tasks yet.')
+      return text(JSON.stringify(list))
+    }
     default:
       throw new Error(`unknown tool ${name}`)
   }
@@ -324,7 +413,8 @@ async function handleRpc(msg, ctx) {
         const result = await callTool(params.name, params.arguments, ctx)
         ctx.log?.(`tools/call ${params.name} ${Date.now() - started}ms${result.isError ? ' isError' : ''}`)
         const banner = attentionBanner(ctx.tasks, params.arguments?.task_id)
-        if (banner && params.name !== 'get_code_status' && result.content?.[0]?.type === 'text') {
+        const skipsBanner = ['get_code_status', 'status_all', 'list_decisions', 'log_decision']
+        if (banner && !skipsBanner.includes(params.name) && result.content?.[0]?.type === 'text') {
           result.content[0].text = banner + result.content[0].text
         }
         return ok(result)
@@ -339,6 +429,10 @@ async function handleRpc(msg, ctx) {
 
 export function createHttpServer({ secret, tasks, channel, decisions, log = () => {} }) {
   const prefix = '/mcp/'
+  // Callers that don't care about persistence (most tests) can omit
+  // decisions entirely; log_decision/list_decisions/status_all still work,
+  // just in memory for the life of this server.
+  decisions = decisions || new DecisionLog({})
 
   return http.createServer(async (req, res) => {
     const url = req.url || ''

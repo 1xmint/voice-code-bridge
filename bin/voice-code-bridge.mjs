@@ -4,6 +4,7 @@
 import fs from 'node:fs'
 import { loadConfig, getPaths, getPort } from '../src/config.mjs'
 import { TaskStore } from '../src/tasks.mjs'
+import { DecisionLog } from '../src/decisions.mjs'
 import { Channel } from '../src/channel.mjs'
 import { createHttpServer } from '../src/http.mjs'
 
@@ -31,8 +32,9 @@ async function main() {
 
   const log = makeLogger(paths.logPath)
   const tasks = new TaskStore({ jsonlPath: paths.tasksJsonlPath })
+  const decisions = new DecisionLog({ jsonlPath: paths.decisionsJsonlPath })
   const channel = new Channel({ tasks, log })
-  const server = createHttpServer({ secret: config.secret, tasks, channel, log })
+  const server = createHttpServer({ secret: config.secret, tasks, channel, decisions, log })
   const port = getPort()
 
   // The bridge is registered for every Claude Code session, but only the
