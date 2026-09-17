@@ -590,15 +590,19 @@ async function handleRpc(msg, ctx) {
 // transcript JSONL file (~/.claude/projects/<proj>/<session>.jsonl or a
 // subagent sidecar). Returns null on any read/parse failure or if there's no
 // user entry -- callers must treat that as "no proof", never as a pass.
-function latestUserMessageText(transcriptPath) {
+// Returns the typed text of the most recent real user prompts (newest first),
+// skipping tool_result entries, which the transcript also stores as type
+// 'user'. Empty on any read failure -- callers treat that as "no proof".
+function recentUserPrompts(transcriptPath, limit = 20) {
   let content
   try {
     content = fs.readFileSync(transcriptPath, 'utf8')
   } catch {
-    return null
+    return []
   }
+  const out = []
   const lines = content.split('\n')
-  for (let i = lines.length - 1; i >= 0; i--) {
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
     const line = lines[i].trim()
     if (!line) continue
     let entry
@@ -607,35 +611,28 @@ function latestUserMessageText(transcriptPath) {
     } catch {
       continue // a torn last line from a concurrent write
     }
-    if (entry.type !== 'user') continue
-    const content_ = entry.message?.content
-    if (typeof content_ === 'string') return content_
-    if (Array.isArray(content_)) {
-      const text = content_
-        .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
-        .map((b) => b.text)
-        .join('')
-      return text || null
+    if (entry.type !== 'user' || entry.isSidechain) continue
+    const c = entry.message?.content
+    if (typeof c === 'string') out.push(c)
+    else if (Array.isArray(c)) {
+      const text = c.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('')
+      if (text) out.push(text)
     }
-    return null
   }
-  return null
+  return out
 }
 
-// Proof-of-user-prompt required for a gate 'approve': the id must actually
-// appear in the prompt text, and that exact prompt must be the latest real
-// user message in the named transcript -- not just claimed by whoever POSTed
-// this request. Fails closed: any missing piece (no id/prompt/transcript, a
-// transcript that doesn't parse, no user entry, a mismatched prompt) is
-// rejected, never approved. This is what stops a bare
-// `curl -d '{"action":"approve",...}'` from self-approving a held command:
-// there's no real transcript with that exact prompt as its latest user turn.
+// Proof-of-user-prompt for a gate approval: the id must appear in the prompt,
+// and that exact prompt must be one of the recent real user prompts in the
+// transcript -- not just claimed by whoever POSTed. Checked when the command
+// is rerun, not when the approve arrives: UserPromptSubmit fires before Code
+// saves the prompt, so the transcript can't show it yet at that moment.
+// Fails closed on any missing piece.
 export function verifyApprovalProof({ id, prompt, transcriptPath }) {
   if (!id || !prompt || !transcriptPath) return false
   if (!String(prompt).includes(id)) return false
-  const latest = latestUserMessageText(transcriptPath)
-  if (latest === null) return false
-  return latest.trim() === String(prompt).trim()
+  const want = String(prompt).trim()
+  return recentUserPrompts(transcriptPath).some((p) => p.trim() === want)
 }
 
 // POST /gate/<secret> body: { action: 'check'|'approve', ... }. Used by
@@ -644,6 +641,11 @@ export function verifyApprovalProof({ id, prompt, transcriptPath }) {
 // short-lived child processes. Never exposed as an MCP tool: voice mode
 // answers gates through the existing answer_code_permission tool by
 // request_id, same as any other pending approval.
+// Typed approvals waiting for their transcript proof, by gate id. In memory
+// only, like passes; a worker reload drops them (fail closed).
+const claims = new Map()
+const CLAIM_TTL_MS = 5 * 60_000
+
 async function handleGateRequest(body, tasks, log, passes, decisions, channel) {
   let parsed
   try {
@@ -659,6 +661,18 @@ async function handleGateRequest(body, tasks, log, passes, decisions, channel) {
   if (action === 'check') {
     const { command, repo, agent } = parsed
     const hash = hashCommand(command, repo)
+    // A typed approval claimed earlier becomes a pass only now, once the
+    // prompt it quotes is really in the transcript.
+    for (const [claimId, claim] of claims) {
+      const gate = tasks.getGate(claimId)
+      if (!gate || gate.status !== 'pending' || Date.now() - claim.at > CLAIM_TTL_MS) { claims.delete(claimId); continue }
+      if (hashCommand(gate.command, gate.repo) !== hash) continue
+      if (!verifyApprovalProof({ id: claimId, prompt: claim.prompt, transcriptPath: claim.transcript_path })) continue
+      claims.delete(claimId)
+      const issued = passes.issue({ hash, gate_id: gate.request_id, approver: claim.approver })
+      tasks.answerGate(gate.request_id, 'allow')
+      decisions.log({ decision: 'gate pass issued', reason: `gate ${gate.request_id} hash ${hash} approver ${issued.approver}`, category: 'gate_pass_issued' })
+    }
     const pass = passes.consume(hash)
     if (pass) {
       decisions.log({ decision: 'gate pass used', reason: `gate ${pass.gate_id} hash ${hash} approver ${pass.approver}`, category: 'gate_pass_used' })
@@ -678,16 +692,13 @@ async function handleGateRequest(body, tasks, log, passes, decisions, channel) {
   // self-approve any held command with a single curl call.
   if (action === 'approve') {
     const { id, approver, prompt, transcript_path } = parsed
-    if (!verifyApprovalProof({ id, prompt, transcriptPath: transcript_path })) {
-      log?.(`gate approve rejected for ${id}: no matching user prompt in transcript`)
+    const gate = tasks.getGate(id)
+    if (!gate || gate.status !== 'pending' || !prompt || !String(prompt).includes(id) || !transcript_path) {
       return { statusCode: 200, body: { ok: false } }
     }
-    const gate = tasks.getGate(id)
-    if (!gate || gate.status !== 'pending') return { statusCode: 200, body: { ok: false } }
-    const hash = hashCommand(gate.command, gate.repo)
-    const pass = passes.issue({ hash, gate_id: gate.request_id, approver: approver || 'user' })
-    tasks.answerGate(gate.request_id, 'allow')
-    decisions.log({ decision: 'gate pass issued', reason: `gate ${gate.request_id} hash ${hash} approver ${pass.approver}`, category: 'gate_pass_issued' })
+    // Only a claim: proof is checked against the transcript at the rerun.
+    claims.set(id, { prompt, transcript_path, approver: approver || 'user', at: Date.now() })
+    log?.(`gate approval claimed for ${id}; checked against the transcript on rerun`)
     channel?.sendGateApprovedNotice?.({ id: gate.request_id, command: gate.command })
     return { statusCode: 200, body: { ok: true } }
   }
