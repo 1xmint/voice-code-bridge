@@ -5,6 +5,9 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
 
+// A gate hold older than this is past the hook's 25s wait (see listPendingGates).
+const GATE_TTL_MS = 30_000
+
 // classifier_outage: Claude Code's auto-mode permission classifier is
 // temporarily unavailable, so Code is paused waiting to retry. Kept distinct
 // from a real deny (which just returns the task to its prior status) so it
@@ -41,7 +44,7 @@ export class TaskStore {
   // owned them died with the old process, so they can no longer be answered.
   // Tasks that were still in flight get a restart_note so voice hears that
   // Code may have lost them, instead of waiting on a silent task.
-  load() {
+  load({ keepPending = false } = {}) {
     if (!this.jsonlPath || !fs.existsSync(this.jsonlPath)) return 0
     let lines
     try {
@@ -60,7 +63,8 @@ export class TaskStore {
       this._replay(r)
     }
     for (const task of this.tasks.values()) {
-      if (task.pendingPermission) {
+      // A worker restarted by the doorway keeps them: Code's prompt is still open.
+      if (task.pendingPermission && !keepPending) {
         task.status = task.priorStatus || 'working'
         task.pendingPermission = null
       }
@@ -341,7 +345,13 @@ export class TaskStore {
     return this.gates.get(requestId) || null
   }
 
-  listPendingGates() {
+  // The hook stops waiting after 25s and hands the prompt back to the
+  // terminal, so a gate still pending after that is already decided
+  // elsewhere; showing it to voice would invite an answer nobody receives.
+  listPendingGates(now = Date.now()) {
+    for (const g of this.gates.values()) {
+      if (g.status === 'pending' && now - new Date(g.created_at).getTime() > GATE_TTL_MS) g.status = 'expired'
+    }
     return [...this.gates.values()].filter((g) => g.status === 'pending')
   }
 

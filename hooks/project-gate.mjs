@@ -23,6 +23,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
+import { pathToFileURL } from 'node:url'
 
 // --- Gate categories -------------------------------------------------------
 // Each pattern is checked against the full command string. Kept conservative
@@ -87,8 +88,19 @@ const GATE_PATTERNS = [
   },
 ]
 
+// Heredoc bodies and commit messages are data: test text or a message that
+// mentions "git push --force" is not a force-push. Other quoted text is still
+// matched on purpose, since a quoted URL (curl "https://api.x.com/...") or
+// bash -c "..." can be the real action.
+export function stripData(command) {
+  let s = String(command || '')
+  s = s.replace(/<<-?\s*['"]?(\w+)['"]?[^\n]*\n[\s\S]*?\n\s*\1\s*(?=\n|$)/g, '<<heredoc')
+  s = s.replace(/(\s(?:-m|--message)(?:\s+|=))(?:'[^']*'|"(?:[^"\\]|\\.)*")/g, '$1""')
+  return s
+}
+
 export function matchGate(command) {
-  const cmd = String(command || '')
+  const cmd = stripData(command)
   for (const { category, label, patterns } of GATE_PATTERNS) {
     for (const re of patterns) {
       if (re.test(cmd)) return { category, label }
@@ -237,6 +249,8 @@ async function main() {
   await run(input)
 }
 
-if (process.argv[1] && import.meta.url === `file://${process.argv[1].replace(/\\/g, '/')}`) {
+// pathToFileURL, not a hand-built file:// string: on Windows the URL has three
+// slashes, the old check never matched, and the hook silently did nothing.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then(() => process.exit(0))
 }

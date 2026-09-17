@@ -70,3 +70,32 @@ test('holdForDecision: reports the answered decision once the bridge has one', a
   assert.equal(decision, 'allow')
   server.close()
 })
+test('run as a script, the way Claude Code runs it, a held command with no bridge falls back to ask', async () => {
+  const { spawnSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const os = await import('node:os')
+  const hook = fileURLToPath(new URL('../hooks/project-gate.mjs', import.meta.url))
+  const home = (await import('node:fs')).mkdtempSync((await import('node:path')).join(os.tmpdir(), 'vcb-gate-'))
+  const input = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'echo git push --force' } })
+  const r = spawnSync(process.execPath, [hook], { input, encoding: 'utf8', env: { ...process.env, VCB_HOME: home, VCB_PORT: '1' } })
+  assert.equal(r.status, 0)
+  assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'ask')
+})
+
+test('matchGate ignores gated words in heredocs and commit messages, but still holds real commands and quoted URLs', () => {
+  const heredoc = ['cat >> notes.txt <<' + "'EOF'", 'git push --force origin main', 'EOF', 'git add notes.txt'].join(String.fromCharCode(10))
+  assert.equal(matchGate(heredoc), null)
+  assert.equal(matchGate('git commit -m "never git push --force here"'), null)
+  assert.equal(matchGate('curl -X POST "https://api.x.com/2/tweets"').category, 'post_public')
+  assert.equal(matchGate('git push --force origin x').category, 'history_rewrite')
+  assert.equal(matchGate(heredoc + String.fromCharCode(10) + 'git push -f origin x').category, 'history_rewrite')
+})
+
+test('gate holds past the hook wait drop out of the pending list', async () => {
+  const { TaskStore } = await import('../src/tasks.mjs')
+  const store = new TaskStore({})
+  const g = store.registerGate({ command: 'git push --force' })
+  assert.equal(store.listPendingGates().length, 1)
+  assert.equal(store.listPendingGates(Date.now() + 31_000).length, 0)
+  assert.equal(store.getGate(g.request_id).status, 'expired')
+})
