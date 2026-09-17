@@ -19,6 +19,21 @@ const DEFAULT_MAX_LINES = 5000
 const LOG_TAIL = 5
 const BLOCKED_NOTIFICATIONS = new Set(['agent_needs_input', 'permission_prompt', 'elicitation_dialog', 'elicitation_url_dialog'])
 
+// A short, spoken-friendly line for buildAgentTree's `waiting_on_terminal`:
+// the gate hook no longer forwards a generic PermissionRequest passthrough
+// (see hooks/project-gate.mjs), so this Notification-based notice is now the
+// only signal that Claude Code is sitting at a prompt in the terminal.
+const NOTIFICATION_MESSAGES = {
+  agent_needs_input: 'Claude Code is waiting for your input.',
+  permission_prompt: 'Claude Code is waiting on a permission prompt.',
+  elicitation_dialog: 'Claude Code is waiting on a dialog.',
+  elicitation_url_dialog: 'Claude Code is waiting on a dialog.',
+}
+
+function describeNotification(notificationType) {
+  return NOTIFICATION_MESSAGES[notificationType] || `Claude Code is waiting at the terminal (${notificationType || 'a notification'}).`
+}
+
 function readTail(filePath, maxLines) {
   if (!filePath || !fs.existsSync(filePath)) return []
   const raw = fs.readFileSync(filePath, 'utf8')
@@ -195,10 +210,14 @@ export function buildAgentTree({ eventsPath, lines, now = Date.now(), maxLines =
     const sessionId = event.session_id || 'unknown'
     let session = sessions.get(sessionId)
     if (!session) {
-      session = { session_id: sessionId, cwd: event.cwd || null, nodes: new Map(), order: [] }
+      session = { session_id: sessionId, cwd: event.cwd || null, nodes: new Map(), order: [], lastEventType: null, lastEventAt: null, lastNotificationType: null, lastToolAt: null }
       sessions.set(sessionId, session)
     }
     if (event.cwd) session.cwd = event.cwd
+    session.lastEventType = event.event
+    session.lastEventAt = event.at
+    if (event.event === 'Notification') session.lastNotificationType = event.notification_type
+    if (event.event === 'PreToolUse' || event.event === 'PostToolUse' || event.event === 'PostToolUseFailure') session.lastToolAt = event.at
     const key = event.agent_id || '__main__'
     let node = session.nodes.get(key)
     if (!node) {
@@ -215,12 +234,22 @@ export function buildAgentTree({ eventsPath, lines, now = Date.now(), maxLines =
     const main = nodes.find((n) => !n.agent_id) || null
     const subagents = nodes.filter((n) => n.agent_id)
     const waitingOn = subagents.filter((n) => n.state === 'running' || n.state === 'blocked').map((n) => n.agent_id)
+    // Non-blocking notice: the latest event in this session was a
+    // Notification (Claude Code showing a prompt / waiting for input) and
+    // it's newer than the session's last PreToolUse/PostToolUse, i.e.
+    // nothing has run since. Doesn't change `state` -- this is a hint, not
+    // a status.
+    const waitingOnTerminal =
+      session.lastEventType === 'Notification' && (!session.lastToolAt || session.lastEventAt > session.lastToolAt)
+        ? describeNotification(session.lastNotificationType)
+        : null
     tree.push({
       session_id: session.session_id,
       cwd: session.cwd,
       main: main ? summarize(main, now) : null,
       subagents: subagents.map((n) => summarize(n, now)),
       waiting_on: waitingOn.length ? waitingOn : null,
+      waiting_on_terminal: waitingOnTerminal,
     })
   }
   return tree

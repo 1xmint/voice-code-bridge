@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Claude Code hook script for voice-code-bridge. NOT installed automatically
 // -- see the settings.json snippet in docs/hooks.md (or the task report) to
-// wire it up. One file, two hook events, dispatched by hook_event_name on
+// wire it up. Handles one hook event, dispatched by hook_event_name on
 // stdin:
 //
 //   PreToolUse (matcher: Bash) -- the project gate. Always HOLDS (never
@@ -11,12 +11,14 @@
 //   for a human answer; on timeout or if the bridge is unreachable, falls
 //   back to "ask" (the normal interactive prompt) -- never "allow".
 //
-//   PermissionRequest (matcher: broad, e.g. "*") -- passes any auto-mode
-//   fallback permission prompt through to the bridge so voice mode can see
-//   and answer it. Same timeout/unreachable rule: falls back to "ask",
-//   never "allow". Project gates above still hold regardless of this path.
+// There used to be a second, PermissionRequest (matcher: "*") passthrough
+// here that forwarded every auto-mode fallback permission prompt to the
+// bridge. That's gone: it was a catch-all with no gating logic of its own.
+// Visibility into "Claude Code is sitting at a permission prompt" now comes
+// from the Notification hook (scripts/agent-tree-hook.mjs, already wired
+// separately) instead -- see waiting_on_terminal in src/events.mjs.
 //
-// Both talk to the bridge over POST /gate/<secret> (see src/http.mjs),
+// Talks to the bridge over POST /gate/<secret> (see src/http.mjs),
 // reading the secret from the same config file the bridge itself uses --
 // no network credential beyond what's already on this machine.
 import fs from 'node:fs'
@@ -24,86 +26,129 @@ import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
 import { pathToFileURL } from 'node:url'
+import { parseShellCommands, ParseError } from './shell-parse.mjs'
 
 // --- Gate categories -------------------------------------------------------
-// Each pattern is checked against the full command string. Kept conservative
-// (matches broadly) since a false "hold" costs a confirmation click, while a
-// false pass-through costs real money, a public post, or lost history.
-const GATE_PATTERNS = [
-  {
-    category: 'deploy',
-    label: 'a deploy to a live server',
-    patterns: [
-      /\bssh\b/i,
-      /\bscp\b/i,
-      /\brsync\b/i,
-      /\bsystemctl\b.*\b(restart|stop|start|reload)\b/i,
-      /\bfly\s+deploy\b/i,
-      /\bflyctl\s+deploy\b/i,
-      /\bvercel\b.*\b(deploy|--prod)\b/i,
-      /\bwrangler\b.*\bdeploy\b/i,
-      /\b(deploy|release)\.(sh|mjs|js|py|ps1)\b/i,
-      /\bnpm\s+run\s+deploy\b/i,
-      /\bpm2\s+(restart|reload|deploy)\b/i,
-    ],
-  },
-  {
-    category: 'spend_sign',
-    label: 'spending or signing',
-    patterns: [
-      /\bcast\s+send\b/i,
-      /\bcast\s+wallet\s+sign\b/i,
-      /\bturnkey\b/i,
-      /\bprivate[_-]?key\b/i,
-      /\bwallet\s+sign\b/i,
-      /\bsign(-|\s)transaction\b/i,
-      /\bsolana\s+transfer\b/i,
-      /\beth\s+sendtransaction\b/i,
-    ],
-  },
-  {
-    category: 'post_public',
-    label: 'posting publicly',
-    patterns: [
-      /api\.twitter\.com/i,
-      /api\.x\.com/i,
-      /\btweepy\b.*\bpost\b/i,
-      /\bpost[_-]?tweet\b/i,
-      /\brealorrug\b.*\b(publish|post)\b/i,
-      /\b--publish\b/i,
-      /\bpublish[_-]?mode\b/i,
-    ],
-  },
-  {
-    category: 'history_rewrite',
-    label: 'a force-push or history rewrite',
-    patterns: [
-      /\bgit\s+push\b.*(--force\b|-f\b)/i,
-      /\bgit\s+reset\s+--hard\b/i,
-      /\bgit\s+rebase\b.*\bmain\b/i,
-      /\bgit\s+rebase\s+main\b/i,
-      /\bgit\s+filter-branch\b/i,
-      /\bgit\s+filter-repo\b/i,
-    ],
-  },
+// matchGate used to run regexes over the whole command string. That gives
+// false holds when a gated word only appears as data: echo text, a heredoc
+// body, a commit message, a grep/sed pattern on a test file. It now parses
+// the command (see shell-parse.mjs) into the argv(s) it actually runs and
+// checks *those*, plus a conservative text scan for the handful of
+// interpreter strings (node -e / python -c / pwsh -Command) that are code,
+// not shell, so can't be argv-parsed.
+//
+// Unparseable input (unbalanced quote, unterminated heredoc/subshell) fails
+// closed: category 'unparseable', always a hold, never a silent pass.
+const RAW_TEXT_PATTERNS = [
+  { category: 'history_rewrite', label: 'a force-push or history rewrite', re: /\bgit\s+push\b[^\n]*(--force(-with-lease|-if-includes)?\b|(^|\s)-f\b)|\bfilter-repo\b|\bfilter-branch\b/i },
+  { category: 'post_public', label: 'posting publicly', re: /api\.(x|twitter)\.com|upload\.twitter\.com|post[_-]?tweet|--publish\b/i },
+  { category: 'spend_sign', label: 'spending or signing', re: /\bcast\s+send\b|\bcast\s+wallet\s+sign\b|\bturnkey\b|private[_-]?key|sendtransaction|solana\s+transfer|spl-token\s+transfer/i },
+  { category: 'deploy', label: 'a deploy to a live server', re: /\bssh\b|\bscp\b|\brsync\b|\bflyctl\s+deploy\b|\bwrangler\s+(deploy|publish)\b|\bsystemctl\s+(restart|stop|start|reload)\b/i },
 ]
 
-// Heredoc bodies and commit messages are data: test text or a message that
-// mentions "git push --force" is not a force-push. Other quoted text is still
-// matched on purpose, since a quoted URL (curl "https://api.x.com/...") or
-// bash -c "..." can be the real action.
-export function stripData(command) {
-  let s = String(command || '')
-  s = s.replace(/<<-?\s*['"]?(\w+)['"]?[^\n]*\n[\s\S]*?\n\s*\1\s*(?=\n|$)/g, '<<heredoc')
-  s = s.replace(/(\s(?:-m|--message)(?:\s+|=))(?:'[^']*'|"(?:[^"\\]|\\.)*")/g, '$1""')
-  return s
+function gitGlobalOptSkip(args, i) {
+  const a = args[i]
+  if (a === '-C' || a === '-c' || a === '--git-dir' || a === '--work-tree' || a === '--namespace') return 2
+  if (/^--(git-dir|work-tree|namespace)=/.test(a)) return 1
+  if (/^-[a-zA-Z]$/.test(a) || a === '--no-pager' || a === '--paginate' || a === '-p') return 1
+  return 0
 }
 
+function matchHistoryRewrite(argv) {
+  if (basenameLower(argv[0]) !== 'git') return null
+  let i = 1
+  while (i < argv.length) {
+    const skip = gitGlobalOptSkip(argv, i)
+    if (!skip) break
+    i += skip
+  }
+  const sub = argv[i]
+  if (!sub) return null
+  if (sub === 'filter-branch' || sub === 'filter-repo') return { category: 'history_rewrite', label: 'a force-push or history rewrite' }
+  if (sub === 'push') {
+    const rest = argv.slice(i + 1)
+    const forced = rest.some((a) => a === '-f' || a === '--force' || a === '--force-with-lease' || a === '--force-if-includes' || /^--force-with-lease=/.test(a) || a.startsWith('+'))
+    if (forced) return { category: 'history_rewrite', label: 'a force-push or history rewrite' }
+  }
+  // git reset --hard / git rebase: intentionally not held here -- neither
+  // can be told apart from a purely-local, already-unpushed reset/rebase
+  // from argv alone, and holding every reset --hard / rebase would be a
+  // constant false-positive tax. Left to the normal permission flow.
+  return null
+}
+
+function basenameLower(p) {
+  if (!p) return ''
+  const s = String(p).replace(/\\/g, '/')
+  const b = s.slice(s.lastIndexOf('/') + 1)
+  return b.toLowerCase()
+}
+
+function matchPostPublic(argv) {
+  const name = basenameLower(argv[0])
+  const args = argv.slice(1)
+  const httpTools = new Set(['curl', 'wget', 'http', 'https', 'invoke-webrequest', 'iwr', 'curl.exe'])
+  if (httpTools.has(name)) {
+    if (args.some((a) => /api\.(x|twitter)\.com|upload\.twitter\.com/i.test(a))) return { category: 'post_public', label: 'posting publicly' }
+  }
+  if (/post[_-]?tweet/i.test(name) || args.some((a) => /post[_-]?tweet/i.test(a))) return { category: 'post_public', label: 'posting publicly' }
+  if (name === 'realorrug' && args.some((a) => /^(--)?(publish|post)$/i.test(a))) return { category: 'post_public', label: 'posting publicly' }
+  if (argv.some((a) => a === '--publish')) return { category: 'post_public', label: 'posting publicly' }
+  return null
+}
+
+function matchSpendSign(argv) {
+  const name = basenameLower(argv[0])
+  const args = argv.slice(1)
+  if (name === 'cast' && args[0] === 'send') return { category: 'spend_sign', label: 'spending or signing' }
+  if (name === 'cast' && args[0] === 'wallet' && args[1] === 'sign') return { category: 'spend_sign', label: 'spending or signing' }
+  if (name === 'solana' && args[0] === 'transfer') return { category: 'spend_sign', label: 'spending or signing' }
+  if (name === 'spl-token' && args[0] === 'transfer') return { category: 'spend_sign', label: 'spending or signing' }
+  if (name === 'turnkey') return { category: 'spend_sign', label: 'spending or signing' }
+  if (argv.some((a) => /sendtransaction$/i.test(a) || a === 'eth_sendRawTransaction' || a === 'eth_sendTransaction')) return { category: 'spend_sign', label: 'spending or signing' }
+  if (argv.some((a) => /^--?private[_-]key(=|$)/i.test(a))) return { category: 'spend_sign', label: 'spending or signing' }
+  return null
+}
+
+const DEPLOY_EXECUTABLES = new Set(['ssh', 'scp', 'rsync'])
+function matchDeploy(argv) {
+  const name = basenameLower(argv[0])
+  const args = argv.slice(1)
+  if (DEPLOY_EXECUTABLES.has(name)) return { category: 'deploy', label: 'a deploy to a live server' }
+  if ((name === 'fly' || name === 'flyctl') && args[0] === 'deploy') return { category: 'deploy', label: 'a deploy to a live server' }
+  if (name === 'vercel' && (args.includes('deploy') || args.includes('--prod'))) return { category: 'deploy', label: 'a deploy to a live server' }
+  if (name === 'wrangler' && (args[0] === 'deploy' || args[0] === 'publish')) return { category: 'deploy', label: 'a deploy to a live server' }
+  if (['npm', 'pnpm', 'yarn'].includes(name) && args[0] === 'run' && args[1] === 'deploy') return { category: 'deploy', label: 'a deploy to a live server' }
+  if (name === 'pm2' && ['restart', 'reload', 'deploy'].includes(args[0])) return { category: 'deploy', label: 'a deploy to a live server' }
+  if (name === 'systemctl' && ['restart', 'stop', 'start', 'reload'].includes(args[0])) return { category: 'deploy', label: 'a deploy to a live server' }
+  const releaseScript = /^(deploy|release)\.(sh|mjs|js|py|ps1)$/i
+  if (releaseScript.test(name)) return { category: 'deploy', label: 'a deploy to a live server' }
+  if (['bash', 'sh', 'zsh', 'node', 'python', 'python3', 'pwsh', 'powershell'].includes(name)) {
+    const firstNonFlag = args.find((a) => !a.startsWith('-'))
+    if (firstNonFlag && releaseScript.test(basenameLower(firstNonFlag))) return { category: 'deploy', label: 'a deploy to a live server' }
+  }
+  return null
+}
+
+const ARGV_MATCHERS = [matchHistoryRewrite, matchPostPublic, matchSpendSign, matchDeploy]
+
 export function matchGate(command) {
-  const cmd = stripData(command)
-  for (const { category, label, patterns } of GATE_PATTERNS) {
-    for (const re of patterns) {
-      if (re.test(cmd)) return { category, label }
+  let parsed
+  try {
+    parsed = parseShellCommands(command)
+  } catch (err) {
+    if (err instanceof ParseError) return { category: 'unparseable', label: `an unparseable command (failing closed: ${err.message})` }
+    throw err
+  }
+  for (const argv of parsed.commands) {
+    for (const matcher of ARGV_MATCHERS) {
+      const hit = matcher(argv)
+      if (hit) return hit
+    }
+  }
+  for (const text of parsed.rawTexts) {
+    for (const { category, label, re } of RAW_TEXT_PATTERNS) {
+      if (re.test(text)) return { category, label }
     }
   }
   return null
@@ -215,27 +260,10 @@ async function handlePreToolUse(input) {
   emit('PreToolUse', 'permissionDecision', permissionDecision, `Project gate: ${match.label}.`)
 }
 
-async function handlePermissionRequest(input) {
-  const secret = readSecret()
-  const decision = await holdForDecision({
-    secret,
-    payload: {
-      kind: 'ask',
-      tool_name: input?.tool_name,
-      command: input?.tool_input?.command || JSON.stringify(input?.tool_input || {}),
-      description: `Permission needed for ${input?.tool_name}`,
-      repo: input?.cwd,
-      agent: input?.agent_type || input?.agent_id || 'main',
-    },
-  })
-  const decisionValue = decision === 'deny' ? 'deny' : decision === 'allow' ? 'allow' : 'ask'
-  emit('PermissionRequest', 'decision', decisionValue, 'Routed through voice-code-bridge.')
-}
-
 export async function run(input) {
   if (input?.hook_event_name === 'PreToolUse') return handlePreToolUse(input)
-  if (input?.hook_event_name === 'PermissionRequest') return handlePermissionRequest(input)
-  // Unknown event: no opinion.
+  // Unknown event (including the old PermissionRequest passthrough, no
+  // longer handled here): no opinion.
 }
 
 async function main() {
