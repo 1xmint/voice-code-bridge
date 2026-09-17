@@ -136,6 +136,9 @@ function agentsSummary(eventsPath) {
   return recent.map((s) => ({
     main: brief(s.main),
     helpers: (s.subagents || []).filter((a) => a.state !== 'done').map(brief),
+    // Non-blocking: Claude Code showed a prompt / is waiting for input and
+    // nothing has run since. Doesn't affect main.state.
+    ...(s.waiting_on_terminal ? { waiting_on_terminal: s.waiting_on_terminal } : {}),
   }))
 }
 

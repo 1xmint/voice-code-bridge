@@ -119,6 +119,26 @@ test('truncate handles null and long strings', () => {
   assert.equal(truncate('hello world', 5), 'hello…')
 })
 
+test('waiting_on_terminal is set when the latest event is a Notification newer than the last tool use', () => {
+  const events = [
+    { at: '2026-09-16T10:00:00.000Z', event: 'PreToolUse', session_id: 's1', tool_name: 'Bash' },
+    { at: '2026-09-16T10:00:01.000Z', event: 'PostToolUse', session_id: 's1', tool_name: 'Bash' },
+    { at: '2026-09-16T10:00:02.000Z', event: 'Notification', session_id: 's1', notification_type: 'permission_prompt' },
+  ]
+  const tree = buildAgentTree({ lines: events, now: Date.parse('2026-09-16T10:00:03.000Z') })
+  assert.match(tree[0].waiting_on_terminal, /permission prompt/)
+})
+
+test('waiting_on_terminal clears once a tool has run after the notification', () => {
+  const events = [
+    { at: '2026-09-16T10:00:00.000Z', event: 'Notification', session_id: 's1', notification_type: 'permission_prompt' },
+    { at: '2026-09-16T10:00:01.000Z', event: 'PreToolUse', session_id: 's1', tool_name: 'Bash' },
+    { at: '2026-09-16T10:00:02.000Z', event: 'PostToolUse', session_id: 's1', tool_name: 'Bash' },
+  ]
+  const tree = buildAgentTree({ lines: events, now: Date.parse('2026-09-16T10:00:03.000Z') })
+  assert.equal(tree[0].waiting_on_terminal, null)
+})
+
 test('multiple sessions stay separate trees', () => {
   const events = [
     { at: '2026-09-16T10:00:00.000Z', event: 'PreToolUse', session_id: 's1', tool_name: 'Bash' },

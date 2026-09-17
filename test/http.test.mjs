@@ -548,3 +548,37 @@ test('get_code_status includes running helpers from the agent tree', async (t) =
   assert.equal(s.agents[0].helpers[0].who, 'orch-debugger')
   assert.match(s.agents[0].helpers[0].step, /^Read/)
 })
+
+test('get_code_status surfaces a waiting_on_terminal notice when the last event was a Notification', async (t) => {
+  const eventsPath = tempPath('events.jsonl')
+  const t0 = new Date()
+  const at = (offsetSeconds) => new Date(t0.getTime() + offsetSeconds * 1000).toISOString()
+  const ev = (o) => JSON.stringify({ session_id: 's1', cwd: 'C:/x', ...o })
+  fs.writeFileSync(eventsPath, [
+    ev({ at: at(0), event: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    ev({ at: at(1), event: 'PostToolUse', tool_name: 'Bash' }),
+    ev({ at: at(2), event: 'Notification', notification_type: 'permission_prompt' }),
+  ].join(String.fromCharCode(10)) + String.fromCharCode(10))
+  t.after(() => fs.rmSync(eventsPath, { force: true }))
+  const { port, tasks } = await withServer(t, { eventsPath })
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  const s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.match(s.agents[0].waiting_on_terminal, /permission prompt/)
+})
+
+test('get_code_status has no waiting_on_terminal notice once a tool has run after the notification', async (t) => {
+  const eventsPath = tempPath('events.jsonl')
+  const t0 = new Date()
+  const at = (offsetSeconds) => new Date(t0.getTime() + offsetSeconds * 1000).toISOString()
+  const ev = (o) => JSON.stringify({ session_id: 's1', cwd: 'C:/x', ...o })
+  fs.writeFileSync(eventsPath, [
+    ev({ at: at(0), event: 'Notification', notification_type: 'permission_prompt' }),
+    ev({ at: at(1), event: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } }),
+    ev({ at: at(2), event: 'PostToolUse', tool_name: 'Bash' }),
+  ].join(String.fromCharCode(10)) + String.fromCharCode(10))
+  t.after(() => fs.rmSync(eventsPath, { force: true }))
+  const { port, tasks } = await withServer(t, { eventsPath })
+  const { task_id } = tasks.createTask({ instruction: 'x' })
+  const s = JSON.parse(await call(port, 'get_code_status', { task_id }))
+  assert.equal(s.agents[0].waiting_on_terminal, undefined)
+})
