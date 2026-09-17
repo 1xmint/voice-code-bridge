@@ -7,6 +7,7 @@ import http from 'node:http'
 import crypto from 'node:crypto'
 import path from 'node:path'
 import { DecisionLog } from './decisions.mjs'
+import { PassStore, hashCommand } from './passes.mjs'
 import { buildAgentTree } from './events.mjs'
 import { logRelay, listRelays } from './relays.mjs'
 
@@ -408,7 +409,7 @@ function text(t) {
   return { content: [{ type: 'text', text: t }] }
 }
 
-async function callTool(name, args, { tasks, channel, decisions, eventsPath, relaysPath }) {
+async function callTool(name, args, { tasks, channel, decisions, passes, eventsPath, relaysPath }) {
   switch (name) {
     case 'send_to_code': {
       if (!channel || !channel.ready) {
@@ -487,9 +488,15 @@ async function callTool(name, args, { tasks, channel, decisions, eventsPath, rel
       if (gate && gate.status === 'pending') {
         tasks.answerGate(request_id, decision)
         logRelay(relaysPath, { from: 'voice', to: 'code', kind: 'gate_verdict', content: decision, task_id: gate.task_id })
+        if (decision === 'allow') {
+          const hash = hashCommand(gate.command, gate.repo)
+          const pass = passes.issue({ hash, gate_id: gate.request_id, approver: 'voice' })
+          decisions.log({ decision: 'gate pass issued', reason: `gate ${gate.request_id} hash ${hash} approver ${pass.approver}`, category: 'gate_pass_issued' })
+          channel?.sendGateApprovedNotice?.({ id: gate.request_id, command: gate.command })
+        }
         return text(`Sent ${decision}.`)
       }
-      return { ...text('No pending approval with that id. It may have already been answered.'), isError: true }
+      return text('Already answered or no longer pending.')
     }
     case 'cancel_code_task': {
       const { task_id } = args || {}
@@ -584,7 +591,7 @@ async function handleRpc(msg, ctx) {
 // poll rather than hold a channel connection open. Never exposed as an MCP
 // tool: voice mode answers gates through the existing answer_code_permission
 // tool by request_id, same as any other pending approval.
-async function handleGateRequest(body, tasks, log) {
+async function handleGateRequest(body, tasks, log, passes, decisions, channel) {
   let parsed
   try {
     parsed = JSON.parse(body)
@@ -603,16 +610,52 @@ async function handleGateRequest(body, tasks, log) {
     if (!gate) return { statusCode: 404, body: { status: 'unknown' } }
     return { statusCode: 200, body: { status: gate.status } }
   }
+  // action 'check': the deny-now-approve-later gate check from
+  // hooks/project-gate.mjs's PreToolUse hook. Consumes a matching pass if
+  // one exists (one use only); otherwise registers the command as a pending
+  // gate for later approval and reports its id back to the hook.
+  if (action === 'check') {
+    const { command, repo, agent } = parsed
+    const hash = hashCommand(command, repo)
+    const pass = passes.consume(hash)
+    if (pass) {
+      decisions.log({ decision: 'gate pass used', reason: `gate ${pass.gate_id} hash ${hash} approver ${pass.approver}`, category: 'gate_pass_used' })
+      log?.(`gate pass used hash=${hash.slice(0, 8)} gate=${pass.gate_id}`)
+      return { statusCode: 200, body: { allow: true } }
+    }
+    const gate = tasks.registerGate({ command, repo, agent, kind: 'hold', description: parsed.description })
+    log?.(`gate registered ${gate.request_id} repo=${gate.repo} agent=${gate.agent}`)
+    return { statusCode: 200, body: { allow: false, id: gate.request_id } }
+  }
+  // action 'approve': a typed "approve <id>"/"yes <id>" reply, forwarded by
+  // hooks/approve-hook.mjs (UserPromptSubmit). Same effect as answering
+  // 'allow' through answer_code_permission, just from a typed prompt instead
+  // of voice.
+  if (action === 'approve') {
+    const { id, approver } = parsed
+    const gate = tasks.getGate(id)
+    if (!gate || gate.status !== 'pending') return { statusCode: 200, body: { ok: false } }
+    const hash = hashCommand(gate.command, gate.repo)
+    const pass = passes.issue({ hash, gate_id: gate.request_id, approver: approver || 'user' })
+    tasks.answerGate(gate.request_id, 'allow')
+    decisions.log({ decision: 'gate pass issued', reason: `gate ${gate.request_id} hash ${hash} approver ${pass.approver}`, category: 'gate_pass_issued' })
+    channel?.sendGateApprovedNotice?.({ id: gate.request_id, command: gate.command })
+    return { statusCode: 200, body: { ok: true } }
+  }
   return { statusCode: 400, body: { error: `unknown action ${action}` } }
 }
 
-export function createHttpServer({ secret, tasks, channel, decisions, log = () => {}, eventsPath, relaysPath }) {
+export function createHttpServer({ secret, tasks, channel, decisions, passes, log = () => {}, eventsPath, relaysPath }) {
   const mcpPrefix = '/mcp/'
   const gatePrefix = '/gate/'
   // Callers that don't care about persistence (most tests) can omit
   // decisions entirely; log_decision/list_decisions/status_all still work,
   // just in memory for the life of this server.
   decisions = decisions || new DecisionLog({})
+  // Same rationale as decisions above: most tests don't care about passes,
+  // so a caller that omits one gets an in-memory-only store for the life of
+  // this server.
+  passes = passes || new PassStore()
 
   return http.createServer(async (req, res) => {
     const url = req.url || ''
@@ -639,7 +682,7 @@ export function createHttpServer({ secret, tasks, channel, decisions, log = () =
     }
 
     if (isGate) {
-      const { statusCode, body: replyBody } = await handleGateRequest(body, tasks, log)
+      const { statusCode, body: replyBody } = await handleGateRequest(body, tasks, log, passes, decisions, channel)
       res.writeHead(statusCode, { 'Content-Type': 'application/json' })
       res.end(replyBody === null ? '' : JSON.stringify(replyBody))
       return
@@ -670,7 +713,7 @@ export function createHttpServer({ secret, tasks, channel, decisions, log = () =
 
     let replies
     try {
-      replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel, decisions, log, eventsPath, relaysPath })))).filter(Boolean)
+      replies = (await Promise.all(messages.map((m) => handleRpc(m, { tasks, channel, decisions, passes, log, eventsPath, relaysPath })))).filter(Boolean)
     } catch (e) {
       log(`http rpc error: ${e.stack || e.message}`)
       res.writeHead(500).end()

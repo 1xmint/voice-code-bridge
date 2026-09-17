@@ -6,6 +6,7 @@ import { PassThrough, Writable } from 'node:stream'
 import { loadConfig, getPaths, getPort } from '../src/config.mjs'
 import { TaskStore } from '../src/tasks.mjs'
 import { DecisionLog } from '../src/decisions.mjs'
+import { PassStore } from '../src/passes.mjs'
 import { Channel } from '../src/channel.mjs'
 import { createHttpServer } from '../src/http.mjs'
 
@@ -37,6 +38,9 @@ async function main() {
   const restored = tasks.load({ keepPending: process.env.VCB_KEEP_PENDING === '1' })
   log(`bridge started; restored ${restored} task(s) from disk`)
   const decisions = new DecisionLog({ jsonlPath: paths.decisionsJsonlPath })
+  // Approval passes for the project gate (see hooks/project-gate.mjs):
+  // in-memory only, HMAC-keyed fresh at each worker startup, never persisted.
+  const passes = new PassStore()
   // As a worker, Code's line arrives over IPC from bin/doorway.mjs; each
   // write goes back whole, so the doorway passes Code the same bytes.
   let io = {}
@@ -47,7 +51,7 @@ async function main() {
     io = { input, output: new Writable({ write(chunk, _enc, cb) { process.send({ t: 'out', text: String(chunk) }, cb) } }) }
   }
   const channel = new Channel({ tasks, log, relaysPath: paths.relaysJsonlPath, ...io })
-  const server = createHttpServer({ secret: config.secret, tasks, channel, decisions, log, eventsPath: paths.eventsJsonlPath, relaysPath: paths.relaysJsonlPath })
+  const server = createHttpServer({ secret: config.secret, tasks, channel, decisions, passes, log, eventsPath: paths.eventsJsonlPath, relaysPath: paths.relaysJsonlPath })
   const port = getPort()
 
   // The bridge is registered for every Claude Code session, but only the

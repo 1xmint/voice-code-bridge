@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { matchGate, holdForDecision } from '../hooks/project-gate.mjs'
+import { matchGate, checkGate } from '../hooks/project-gate.mjs'
 
 test('matchGate: catches the four gated categories', () => {
   assert.equal(matchGate('ssh guardian-vps-tail "systemctl restart app"').category, 'deploy')
@@ -55,57 +55,61 @@ test('matchGate: MUST PASS cases from the parser rewrite', () => {
   assert.equal(matchGate('cat notes.md'), null)
 })
 
-test('holdForDecision: returns ask when the bridge is unreachable, never allow', async () => {
-  const decision = await holdForDecision({ secret: 'nope', port: 65500, payload: { command: 'git push --force' }, timeoutMs: 200, pollMs: 50 })
-  assert.equal(decision, 'ask')
+test('checkGate: denies with no id when the bridge is unreachable, never allows', async () => {
+  const result = await checkGate({ secret: 'nope', port: 65500, command: 'git push --force', timeoutMs: 200 })
+  assert.equal(result.allow, false)
+  assert.equal(result.id, undefined)
 })
 
-test('holdForDecision: returns ask on timeout when the bridge never answers', async () => {
+test('checkGate: denies with no secret, never allows', async () => {
+  const result = await checkGate({ secret: null, port: 65500, command: 'git push --force', timeoutMs: 200 })
+  assert.deepEqual(result, { allow: false })
+})
+
+test('checkGate: registers a gate and denies with its id on the first try', async () => {
   const server = http.createServer((req, res) => {
     let body = ''
     req.on('data', (c) => (body += c))
     req.on('end', () => {
       const parsed = JSON.parse(body)
-      if (parsed.action === 'register') {
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ request_id: 'held-1', task_id: 't1' }))
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ status: 'pending' }))
-      }
+      assert.equal(parsed.action, 'check')
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ allow: false, id: 'held-1' }))
     })
   })
   await new Promise((r) => server.listen(0, '127.0.0.1', r))
   const port = server.address().port
-  const decision = await holdForDecision({ secret: 's', port, payload: { command: 'git push --force' }, timeoutMs: 250, pollMs: 60 })
-  assert.equal(decision, 'ask')
+  const result = await checkGate({ secret: 's', port, command: 'git push --force', repo: '/r', agent: 'main' })
+  assert.equal(result.allow, false)
+  assert.equal(result.id, 'held-1')
   server.close()
 })
 
-test('holdForDecision: reports the answered decision once the bridge has one', async () => {
-  let answered = false
+test('checkGate: allows and does not surface an id when the bridge reports a matching pass', async () => {
   const server = http.createServer((req, res) => {
-    let body = ''
-    req.on('data', (c) => (body += c))
-    req.on('end', () => {
-      const parsed = JSON.parse(body)
-      if (parsed.action === 'register') {
-        setTimeout(() => { answered = true }, 80)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ request_id: 'held-2', task_id: 't1' }))
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ status: answered ? 'allow' : 'pending' }))
-      }
-    })
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ allow: true }))
   })
   await new Promise((r) => server.listen(0, '127.0.0.1', r))
   const port = server.address().port
-  const decision = await holdForDecision({ secret: 's', port, payload: { command: 'git push --force' }, timeoutMs: 2000, pollMs: 40 })
-  assert.equal(decision, 'allow')
+  const result = await checkGate({ secret: 's', port, command: 'git push --force', repo: '/r', agent: 'main' })
+  assert.deepEqual(result, { allow: true })
   server.close()
 })
-test('run as a script, the way Claude Code runs it, a held command with no bridge falls back to ask', async () => {
+
+test('checkGate: a non-200 reply denies with no id', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(500).end()
+  })
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const port = server.address().port
+  const result = await checkGate({ secret: 's', port, command: 'git push --force' })
+  assert.equal(result.allow, false)
+  assert.equal(result.id, undefined)
+  server.close()
+})
+
+test('run as a script, the way Claude Code runs it, a held command with no bridge falls back to deny', async () => {
   const { spawnSync } = await import('node:child_process')
   const { fileURLToPath } = await import('node:url')
   const os = await import('node:os')
@@ -119,7 +123,7 @@ test('run as a script, the way Claude Code runs it, a held command with no bridg
   const input = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'git push --force' } })
   const r = spawnSync(process.execPath, [hook], { input, encoding: 'utf8', env: { ...process.env, VCB_HOME: home, VCB_PORT: '1' } })
   assert.equal(r.status, 0)
-  assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'ask')
+  assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny')
 })
 
 test('matchGate ignores gated words in heredocs and commit messages, but still holds real commands and quoted URLs', () => {
@@ -131,11 +135,11 @@ test('matchGate ignores gated words in heredocs and commit messages, but still h
   assert.equal(matchGate(heredoc + String.fromCharCode(10) + 'git push -f origin x').category, 'history_rewrite')
 })
 
-test('gate holds past the hook wait drop out of the pending list', async () => {
+test('gate holds past GATE_TTL_MS drop out of the pending list', async () => {
   const { TaskStore } = await import('../src/tasks.mjs')
   const store = new TaskStore({})
   const g = store.registerGate({ command: 'git push --force' })
   assert.equal(store.listPendingGates().length, 1)
-  assert.equal(store.listPendingGates(Date.now() + 31_000).length, 0)
+  assert.equal(store.listPendingGates(Date.now() + 31 * 60_000).length, 0)
   assert.equal(store.getGate(g.request_id).status, 'expired')
 })

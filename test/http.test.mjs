@@ -503,12 +503,14 @@ test('project-gate holds and auto-mode fallback asks surface in status with full
   const after = JSON.parse(await call(port, 'get_code_status', { task_id }))
   assert.equal(after.pending_gates, undefined)
 
-  // Unknown/already-answered request_id errors instead of silently allowing.
+  // Unknown/already-answered request_id gets a plain non-error notice,
+  // never an error and never a silent allow.
   const res = await post(port, `/mcp/${SECRET}`, {
     jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'answer_code_permission', arguments: { request_id: 'gate-1', decision: 'allow' } },
   })
   const json = await res.json()
-  assert.equal(json.result.isError, true)
+  assert.equal(json.result.isError, undefined)
+  assert.match(json.result.content[0].text, /Already answered or no longer pending/)
 })
 
 test('gate HTTP endpoint: register then poll reflects the answered decision', async (t) => {

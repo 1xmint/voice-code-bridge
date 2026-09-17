@@ -4,12 +4,17 @@
 // wire it up. Handles one hook event, dispatched by hook_event_name on
 // stdin:
 //
-//   PreToolUse (matcher: Bash) -- the project gate. Always HOLDS (never
-//   default-allows) a Bash command that deploys to a live server, spends or
-//   signs, posts publicly, or force-pushes/rewrites history, regardless of
-//   permission mode. Registers the held command with the bridge and waits
-//   for a human answer; on timeout or if the bridge is unreachable, falls
-//   back to "ask" (the normal interactive prompt) -- never "allow".
+//   PreToolUse (matcher: Bash) -- the project gate. Never HOLDS-and-waits any
+//   more: a Bash command that deploys to a live server, spends or signs,
+//   posts publicly, or force-pushes/rewrites history is denied immediately,
+//   every time, regardless of permission mode -- unless the bridge already
+//   holds a valid, unused, unexpired approval pass for that exact command
+//   (see src/passes.mjs). Denying registers the command as a pending gate
+//   and reports its id in the deny reason, so the user can approve it later
+//   (by voice, or by typing "approve <id>"/"yes <id>", see
+//   hooks/approve-hook.mjs) and Code can simply rerun the same command.
+//   Bridge down, a non-200 reply, no secret, or any other error all deny too
+//   -- this hook fails closed, never "ask" and never "allow".
 //
 // There used to be a second, PermissionRequest (matcher: "*") passthrough
 // here that forwarded every auto-mode fallback permission prompt to the
@@ -173,7 +178,7 @@ export function readSecret(home = getHome()) {
   }
 }
 
-function postJson({ port, path: urlPath, body, timeoutMs }) {
+export function postJson({ port, path: urlPath, body, timeoutMs }) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body)
     const req = http.request(
@@ -197,26 +202,21 @@ function postJson({ port, path: urlPath, body, timeoutMs }) {
   })
 }
 
-// Registers a held/asked action, then polls for a decision until it arrives
-// or timeoutMs elapses. Returns 'allow' | 'deny' | 'ask'. 'ask' covers both
-// an explicit deny-to-prompt-normally case and any failure to reach the
-// bridge at all -- callers must never turn a failure into 'allow'.
-export async function holdForDecision({ secret, port = getPort(), payload, timeoutMs = 25_000, pollMs = 1000 }) {
-  if (!secret) return 'ask'
+// Asks the bridge whether `command` (run from `repo`) is already covered by
+// a valid, unused pass; if not, registers it as a pending gate. Never waits
+// or polls. Returns { allow: true } or { allow: false, id? }. Any failure
+// (no secret, bridge down, non-200, bad JSON, network error) resolves to
+// { allow: false } with no id -- fail closed, the caller must never turn
+// that into an allow.
+export async function checkGate({ secret, port = getPort(), command, repo, agent, timeoutMs = 5000 }) {
+  if (!secret) return { allow: false }
   try {
-    const reg = await postJson({ port, path: `/gate/${secret}`, body: { action: 'register', ...payload }, timeoutMs: 5000 })
-    if (reg.statusCode !== 200 || !reg.body?.request_id) return 'ask'
-    const requestId = reg.body.request_id
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, pollMs))
-      const poll = await postJson({ port, path: `/gate/${secret}`, body: { action: 'poll', request_id: requestId }, timeoutMs: 5000 })
-      const status = poll.body?.status
-      if (status === 'allow' || status === 'deny') return status
-    }
-    return 'ask'
+    const res = await postJson({ port, path: `/gate/${secret}`, body: { action: 'check', command, repo, agent }, timeoutMs })
+    if (res.statusCode !== 200 || !res.body) return { allow: false }
+    if (res.body.allow === true) return { allow: true }
+    return { allow: false, id: res.body.id || null }
   } catch {
-    return 'ask'
+    return { allow: false }
   }
 }
 
@@ -242,22 +242,14 @@ async function handlePreToolUse(input) {
   const match = matchGate(command)
   if (!match) return // no output: let normal permission/auto-mode flow decide
   const secret = readSecret()
-  const decision = await holdForDecision({
-    secret,
-    payload: {
-      kind: 'hold',
-      tool_name: input?.tool_name,
-      command,
-      description: `${match.label}: ${command}`,
-      repo: input?.cwd,
-      agent: input?.agent_type || input?.agent_id || 'main',
-    },
-  })
-  // A gate hold never resolves to "allow" on its own timeout/unreachable path
-  // (holdForDecision already guarantees this); an explicit "deny" answer is
-  // reported as a deny, everything else falls back to the normal prompt.
-  const permissionDecision = decision === 'deny' ? 'deny' : decision === 'allow' ? 'allow' : 'ask'
-  emit('PreToolUse', 'permissionDecision', permissionDecision, `Project gate: ${match.label}.`)
+  const repo = input?.cwd
+  const agent = input?.agent_type || input?.agent_id || 'main'
+  const result = await checkGate({ secret, command, repo, agent })
+  if (result.allow) return // a matching pass was consumed: let it run, no output
+  const reason = result.id
+    ? `Project gate: ${match.label}. Held as ${result.id}. Ask the user to approve, then rerun the exact same command.`
+    : `Project gate: ${match.label}. Ask the user to approve, then rerun the exact same command.`
+  emit('PreToolUse', 'permissionDecision', 'deny', reason)
 }
 
 export async function run(input) {
