@@ -175,22 +175,39 @@ test('a forged approve with no matching transcript is rejected, no pass issued',
   const noTranscript = await post(port, `/gate/${SECRET}`, { action: 'approve', id: first.id, approver: 'user' })
   assert.equal((await noTranscript.json()).ok, false)
 
-  // A transcript_path that points nowhere.
-  const badPath = await post(port, `/gate/${SECRET}`, {
+  // A transcript_path that points nowhere: accepted only as a claim, and the
+  // rerun stays held because the proof never checks out.
+  await post(port, `/gate/${SECRET}`, {
     action: 'approve', id: first.id, approver: 'user', prompt: `approve ${first.id}`, transcript_path: '/no/such/file.jsonl',
   })
-  assert.equal((await badPath.json()).ok, false)
+  const heldBadPath = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
+  assert.equal(heldBadPath.allow, false)
 
-  // A real transcript, but its latest user message doesn't match the
-  // claimed prompt (forged/stale claim).
+  // A real transcript that never contains the claimed prompt.
+  const again = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
   const mismatchPath = writeTranscript('something else entirely')
-  const mismatch = await post(port, `/gate/${SECRET}`, {
-    action: 'approve', id: first.id, approver: 'user', prompt: `approve ${first.id}`, transcript_path: mismatchPath,
+  await post(port, `/gate/${SECRET}`, {
+    action: 'approve', id: again.id, approver: 'user', prompt: `approve ${again.id}`, transcript_path: mismatchPath,
   })
-  assert.equal((await mismatch.json()).ok, false)
-
   const stillHeld = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
   assert.equal(stillHeld.allow, false)
+})
+
+test('approval typed before Code saves the prompt still works on rerun', async (t) => {
+  const { port } = await withServer(t)
+  const command = 'flyctl deploy --app timing'
+  const first = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
+  const prompt = `approve ${first.id}`
+  const transcript_path = writeTranscript('an earlier message')
+  const res = await post(port, `/gate/${SECRET}`, { action: 'approve', id: first.id, approver: 'user', prompt, transcript_path })
+  assert.equal((await res.json()).ok, true)
+  // Code saves the prompt, then a tool result lands after it.
+  fs.appendFileSync(transcript_path, JSON.stringify({ type: 'user', message: { role: 'user', content: prompt } }) + '\n')
+  fs.appendFileSync(transcript_path, JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'x' }] } }) + '\n')
+  const rerun = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
+  assert.equal(rerun.allow, true)
+  const second = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
+  assert.equal(second.allow, false)
 })
 
 test('a real transcript with the matching prompt as the latest user turn is accepted', async (t) => {
