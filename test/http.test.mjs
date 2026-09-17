@@ -513,23 +513,20 @@ test('project-gate holds and auto-mode fallback asks surface in status with full
   assert.match(json.result.content[0].text, /Already answered or no longer pending/)
 })
 
-test('gate HTTP endpoint: register then poll reflects the answered decision', async (t) => {
-  const { port, tasks } = await withServer(t)
-  const reg = await post(port, `/gate/${SECRET}`, { action: 'register', kind: 'ask', tool_name: 'Bash', command: 'npm test', repo: '/repo', agent: 'sub-1' })
-  assert.equal(reg.status, 200)
-  const { request_id } = await reg.json()
-  assert.ok(request_id)
-  let poll = await post(port, `/gate/${SECRET}`, { action: 'poll', request_id })
-  assert.equal((await poll.json()).status, 'pending')
-  tasks.answerGate(request_id, 'allow')
-  poll = await post(port, `/gate/${SECRET}`, { action: 'poll', request_id })
-  assert.equal((await poll.json()).status, 'allow')
-})
-
 test('gate endpoint 404s without the right secret', async (t) => {
   const { port } = await withServer(t)
-  const res = await post(port, '/gate/wrong-secret', { action: 'register' })
+  const res = await post(port, '/gate/wrong-secret', { action: 'check' })
   assert.equal(res.status, 404)
+})
+
+test('gate endpoint: register and poll are no longer served (removed, unused)', async (t) => {
+  const { port } = await withServer(t)
+  const reg = await post(port, `/gate/${SECRET}`, { action: 'register', kind: 'ask', tool_name: 'Bash', command: 'npm test', repo: '/repo', agent: 'sub-1' })
+  assert.equal(reg.status, 400)
+  assert.deepEqual(await reg.json(), { error: 'unknown action register' })
+  const poll = await post(port, `/gate/${SECRET}`, { action: 'poll', request_id: 'whatever' })
+  assert.equal(poll.status, 400)
+  assert.deepEqual(await poll.json(), { error: 'unknown action poll' })
 })
 
 test('get_code_status includes running helpers from the agent tree', async (t) => {

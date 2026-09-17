@@ -44,6 +44,12 @@ export function applyHookEdits(settings, repo) {
   }
 
   add('PreToolUse', { matcher: 'Bash', hooks: [gate] })
+  // PowerShell: same gate, run as a conservative regex scan over the raw
+  // command text instead of a shell-argv parse (see hooks/project-gate.mjs).
+  add('PreToolUse', { matcher: 'PowerShell', hooks: [gate] })
+  // WebFetch: denies a direct fetch of the bridge's own /gate/<secret>
+  // endpoint on localhost -- see hooks/project-gate.mjs's matchWebFetchGate.
+  add('PreToolUse', { matcher: 'WebFetch', hooks: [gate] })
   for (const ev of ['PreToolUse', 'PostToolUse']) add(ev, { matcher: '*', hooks: [tree] })
   for (const ev of ['SubagentStart', 'SubagentStop', 'Stop', 'Notification']) add(ev, { hooks: [tree] })
   // Recognizes a typed "approve <id>"/"yes <id>" reply to a project-gate

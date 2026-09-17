@@ -23,6 +23,18 @@ function fakeChannel() {
   return { notices: [], sendGateApprovedNotice(n) { this.notices.push(n) } }
 }
 
+// Writes a minimal transcript JSONL with `prompt` as the latest type:'user'
+// message, the shape verifyApprovalProof (src/http.mjs) reads.
+function writeTranscript(prompt) {
+  const transcriptPath = path.join(tempDir('vcb-gate-transcript-'), 'session.jsonl')
+  const lines = [
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'earlier turn' } }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: prompt } }),
+  ]
+  fs.writeFileSync(transcriptPath, lines.join('\n') + '\n')
+  return transcriptPath
+}
+
 async function withServer(t) {
   const tasks = new TaskStore({})
   const decisionsPath = path.join(tempDir('vcb-gate-dec-'), 'decisions.jsonl')
@@ -33,6 +45,14 @@ async function withServer(t) {
   const port = server.address().port
   t.after(() => server.close())
   return { port, tasks, decisions, decisionsPath, channel }
+}
+
+async function post(port, urlPath, body) {
+  return fetch(`http://127.0.0.1:${port}${urlPath}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
 }
 
 async function callTool(port, name, args) {
@@ -106,7 +126,9 @@ test('typed "approve <id>" hook path issues a pass, same as voice', async (t) =>
     assert.equal(matchApprove(`approve ${first.id}`), first.id)
     assert.equal(matchApprove(`yes ${first.id}`), first.id)
     assert.equal(matchApprove('not an approval'), null)
-    await handleUserPromptSubmit({ prompt: `approve ${first.id}` })
+    const prompt = `approve ${first.id}`
+    const transcript_path = writeTranscript(prompt)
+    await handleUserPromptSubmit({ prompt, transcript_path })
     const second = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
     assert.equal(second.allow, true)
   } finally {
@@ -140,6 +162,49 @@ test('unknown or already-answered id gets a plain notice, not an error', async (
   const result = await callTool(port, 'answer_code_permission', { request_id: 'no-such-id', decision: 'allow' })
   assert.equal(result.isError, undefined)
   assert.match(result.content[0].text, /Already answered or no longer pending/)
+})
+
+test('a forged approve with no matching transcript is rejected, no pass issued', async (t) => {
+  const { port } = await withServer(t)
+  const command = 'flyctl deploy --app forged'
+  const first = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
+  assert.ok(first.id)
+
+  // Straight to /gate/<secret>, the way a self-approving curl would, with no
+  // transcript at all.
+  const noTranscript = await post(port, `/gate/${SECRET}`, { action: 'approve', id: first.id, approver: 'user' })
+  assert.equal((await noTranscript.json()).ok, false)
+
+  // A transcript_path that points nowhere.
+  const badPath = await post(port, `/gate/${SECRET}`, {
+    action: 'approve', id: first.id, approver: 'user', prompt: `approve ${first.id}`, transcript_path: '/no/such/file.jsonl',
+  })
+  assert.equal((await badPath.json()).ok, false)
+
+  // A real transcript, but its latest user message doesn't match the
+  // claimed prompt (forged/stale claim).
+  const mismatchPath = writeTranscript('something else entirely')
+  const mismatch = await post(port, `/gate/${SECRET}`, {
+    action: 'approve', id: first.id, approver: 'user', prompt: `approve ${first.id}`, transcript_path: mismatchPath,
+  })
+  assert.equal((await mismatch.json()).ok, false)
+
+  const stillHeld = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
+  assert.equal(stillHeld.allow, false)
+})
+
+test('a real transcript with the matching prompt as the latest user turn is accepted', async (t) => {
+  const { port } = await withServer(t)
+  const command = 'flyctl deploy --app real'
+  const first = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
+  const prompt = `approve ${first.id}`
+  const transcript_path = writeTranscript(prompt)
+
+  const res = await post(port, `/gate/${SECRET}`, { action: 'approve', id: first.id, approver: 'user', prompt, transcript_path })
+  assert.equal((await res.json()).ok, true)
+
+  const rerun = await checkGate({ secret: SECRET, port, command, repo: '/repo', agent: 'main' })
+  assert.equal(rerun.allow, true)
 })
 
 test('voice deny does not issue a pass', async (t) => {

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { matchGate, checkGate } from '../hooks/project-gate.mjs'
+import { matchGate, checkGate, matchGateRawText, matchWebFetchGate } from '../hooks/project-gate.mjs'
 
 test('matchGate: catches the four gated categories', () => {
   assert.equal(matchGate('ssh guardian-vps-tail "systemctl restart app"').category, 'deploy')
@@ -53,6 +53,36 @@ test('matchGate: MUST PASS cases from the parser rewrite', () => {
   assert.equal(matchGate('git push origin feat/x'), null)
   assert.equal(matchGate('git reset --hard'), null)
   assert.equal(matchGate('cat notes.md'), null)
+})
+
+test('matchGate: self_approve holds any command touching the gate/approval channel', () => {
+  assert.equal(matchGate('curl -X POST http://127.0.0.1:8790/gate/abc123 -d "{\\"action\\":\\"approve\\"}"').category, 'self_approve')
+  assert.equal(matchGate('cat ~/.voice-code-bridge/config.json').category, 'self_approve')
+  assert.equal(matchGate("node -e \"require('http').request({host:'127.0.0.1',port:8790,path:'/gate/x'})\"").category, 'self_approve')
+  assert.equal(matchGate('python3 -c "import urllib.request; urllib.request.urlopen(\'http://127.0.0.1:8790/gate/x\')"').category, 'self_approve')
+  assert.equal(matchGate('pwsh -Command "Invoke-RestMethod -Uri http://127.0.0.1:8790/gate/x -Method Post"').category, 'self_approve')
+  assert.equal(matchGate('node hooks/approve-hook.mjs').category, 'self_approve')
+})
+
+test('matchGate: self_approve MUST PASS -- plain git/gh and node --test are never held', () => {
+  assert.equal(matchGate('node --test test/gate-approval.test.mjs'), null)
+  assert.equal(matchGate('git add hooks/approve-hook.mjs'), null)
+  assert.equal(matchGate('git commit -m "gate: add self_approve, touches approve-hook.mjs and passes.mjs"'), null)
+  assert.equal(matchGate('gh pr create --title "gate: self_approve" --body "touches src/passes.mjs"'), null)
+})
+
+test('matchGateRawText: conservative regex scan used for the PowerShell tool', () => {
+  assert.equal(matchGateRawText('Invoke-RestMethod -Uri http://127.0.0.1:8790/gate/abc -Method Post').category, 'self_approve')
+  assert.equal(matchGateRawText('git push --force origin main').category, 'history_rewrite')
+  assert.equal(matchGateRawText('Get-ChildItem'), null)
+})
+
+test('matchWebFetchGate: denies fetching the gate endpoint on localhost, leaves everything else alone', () => {
+  assert.equal(matchWebFetchGate('http://127.0.0.1:8790/gate/abc123').category, 'self_approve')
+  assert.equal(matchWebFetchGate('http://localhost:8790/gate/abc123').category, 'self_approve')
+  assert.equal(matchWebFetchGate('http://127.0.0.1:8790/mcp/abc123'), null)
+  assert.equal(matchWebFetchGate('https://example.com/gate/abc123'), null)
+  assert.equal(matchWebFetchGate('not a url'), null)
 })
 
 test('checkGate: denies with no id when the bridge is unreachable, never allows', async () => {

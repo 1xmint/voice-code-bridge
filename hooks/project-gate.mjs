@@ -44,12 +44,68 @@ import { parseShellCommands, ParseError } from './shell-parse.mjs'
 //
 // Unparseable input (unbalanced quote, unterminated heredoc/subshell) fails
 // closed: category 'unparseable', always a hold, never a silent pass.
+// Matches anything that names the gate/approval channel itself: the bridge's
+// /gate/<secret> HTTP path, its config.json (under .voice-code-bridge, which
+// holds the secret), the approve-hook.mjs script, or src/passes.mjs (which
+// issues the one-time passes). Deliberately broad -- see matchSelfApprove
+// and the PowerShell/WebFetch checks below for the narrower call sites that
+// actually use it, since this regex alone would also flag innocuous repo
+// work like `git add hooks/approve-hook.mjs`.
+const SELF_APPROVE_RE = /\/gate\/|\.voice-code-bridge\b|approve-hook\.mjs|\bpasses\.mjs\b/i
+
 const RAW_TEXT_PATTERNS = [
+  { category: 'self_approve', label: 'touching the project-gate approval channel directly', re: SELF_APPROVE_RE },
   { category: 'history_rewrite', label: 'a force-push or history rewrite', re: /\bgit\s+push\b[^\n]*(--force(-with-lease|-if-includes)?\b|(^|\s)-f\b)|\bfilter-repo\b|\bfilter-branch\b/i },
   { category: 'post_public', label: 'posting publicly', re: /api\.(x|twitter)\.com|upload\.twitter\.com|post[_-]?tweet|--publish\b/i },
   { category: 'spend_sign', label: 'spending or signing', re: /\bcast\s+send\b|\bcast\s+wallet\s+sign\b|\bturnkey\b|private[_-]?key|sendtransaction|solana\s+transfer|spl-token\s+transfer/i },
   { category: 'deploy', label: 'a deploy to a live server', re: /\bssh\b|\bscp\b|\brsync\b|\bflyctl\s+deploy\b|\bwrangler\s+(deploy|publish)\b|\bsystemctl\s+(restart|stop|start|reload)\b/i },
 ]
+
+// Runs the raw-text patterns (including self_approve) against a whole chunk
+// of text: used for node -e / python -c / pwsh -Command bodies (see below),
+// and directly for the PowerShell tool's command text, which isn't POSIX
+// shell and so isn't run through parseShellCommands at all.
+export function matchGateRawText(text) {
+  if (typeof text !== 'string' || !text) return null
+  for (const { category, label, re } of RAW_TEXT_PATTERNS) {
+    if (re.test(text)) return { category, label }
+  }
+  return null
+}
+
+// Never held for git/gh: a plain `git add hooks/approve-hook.mjs` or
+// `git log -- src/passes.mjs` is routine repo work, not a self-approval
+// attempt, and would otherwise false-positive on every commit touching
+// these files. Also never held for `node --test ...`: running this repo's
+// own test files (e.g. test/gate-approval.test.mjs) routinely names these
+// paths as test subjects, not as something being executed against the gate.
+function matchSelfApprove(argv) {
+  const name = basenameLower(argv[0])
+  if (name === 'git' || name === 'gh') return null
+  if (name === 'node' && argv.includes('--test')) return null
+  if (argv.some((a) => SELF_APPROVE_RE.test(a))) {
+    return { category: 'self_approve', label: 'touching the project-gate approval channel directly' }
+  }
+  return null
+}
+
+// WebFetch tool_input.url: deny fetching the bridge's gate endpoint directly
+// on localhost -- there is no legitimate reason for a WebFetch call to hit
+// 127.0.0.1/localhost's /gate/<secret> path, so this is a flat deny, not a
+// hold (nothing to ever approve).
+export function matchWebFetchGate(url) {
+  let u
+  try {
+    u = new URL(String(url ?? ''))
+  } catch {
+    return null
+  }
+  const host = u.hostname.toLowerCase()
+  if ((host === '127.0.0.1' || host === 'localhost') && u.pathname.startsWith('/gate/')) {
+    return { category: 'self_approve', label: 'fetching the project-gate approval channel directly' }
+  }
+  return null
+}
 
 function gitGlobalOptSkip(args, i) {
   const a = args[i]
@@ -135,7 +191,7 @@ function matchDeploy(argv) {
   return null
 }
 
-const ARGV_MATCHERS = [matchHistoryRewrite, matchPostPublic, matchSpendSign, matchDeploy]
+const ARGV_MATCHERS = [matchSelfApprove, matchHistoryRewrite, matchPostPublic, matchSpendSign, matchDeploy]
 
 export function matchGate(command) {
   let parsed
@@ -152,9 +208,8 @@ export function matchGate(command) {
     }
   }
   for (const text of parsed.rawTexts) {
-    for (const { category, label, re } of RAW_TEXT_PATTERNS) {
-      if (re.test(text)) return { category, label }
-    }
+    const hit = matchGateRawText(text)
+    if (hit) return hit
   }
   return null
 }
@@ -238,8 +293,24 @@ function emit(hookEventName, decisionField, decision, reason) {
 }
 
 async function handlePreToolUse(input) {
+  const toolName = input?.tool_name
+
+  if (toolName === 'WebFetch') {
+    const match = matchWebFetchGate(input?.tool_input?.url)
+    if (!match) return // no output: let normal permission/auto-mode flow decide
+    // Flat deny, no hold/approve flow: there is no legitimate case for
+    // fetching the gate endpoint directly, so nothing here is ever meant
+    // to be approved and rerun.
+    emit('PreToolUse', 'permissionDecision', 'deny', `Project gate: ${match.label}.`)
+    return
+  }
+
+  // PowerShell isn't POSIX shell -- parseShellCommands would misparse it, so
+  // this runs the same conservative regex scan used for node -e/python -c/
+  // pwsh -Command bodies directly over the whole command text instead of
+  // argv-parsing it.
   const command = input?.tool_input?.command
-  const match = matchGate(command)
+  const match = toolName === 'PowerShell' ? matchGateRawText(command) : matchGate(command)
   if (!match) return // no output: let normal permission/auto-mode flow decide
   const secret = readSecret()
   const repo = input?.cwd
