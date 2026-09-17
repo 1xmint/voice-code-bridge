@@ -4,6 +4,8 @@
 // entry if a previous run left one (that hook is gone; see project-gate.mjs
 // and hooks/project-gate.mjs -- visibility into a permission prompt now
 // comes from the existing Notification -> agent-tree-hook wiring instead).
+// Also installs the UserPromptSubmit -> approve-hook.mjs hook, which
+// recognizes a typed "approve <id>"/"yes <id>" reply to a project-gate hold.
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -20,6 +22,7 @@ export function applyHookEdits(settings, repo) {
   const changes = []
   const tree = cmdFor(repo, 'scripts/agent-tree-hook.mjs')
   const gate = cmdFor(repo, 'hooks/project-gate.mjs')
+  const approve = cmdFor(repo, 'hooks/approve-hook.mjs')
   const hooks = (settings.hooks ||= {})
 
   function add(event, entry) {
@@ -43,6 +46,9 @@ export function applyHookEdits(settings, repo) {
   add('PreToolUse', { matcher: 'Bash', hooks: [gate] })
   for (const ev of ['PreToolUse', 'PostToolUse']) add(ev, { matcher: '*', hooks: [tree] })
   for (const ev of ['SubagentStart', 'SubagentStop', 'Stop', 'Notification']) add(ev, { hooks: [tree] })
+  // Recognizes a typed "approve <id>"/"yes <id>" reply to a project-gate
+  // hold and forwards it to the bridge (see hooks/approve-hook.mjs).
+  add('UserPromptSubmit', { hooks: [approve] })
 
   // No longer installed: the catch-all PermissionRequest -> project-gate
   // passthrough. Remove any entry a previous install left behind.

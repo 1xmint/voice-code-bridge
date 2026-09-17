@@ -165,6 +165,16 @@ export class Channel {
     })
   }
 
+  // Pushed once a project-gate hold (see hooks/project-gate.mjs) gets an
+  // approval pass, so Code knows it can simply rerun the exact same command.
+  sendGateApprovedNotice({ id, command }) {
+    this._write({
+      jsonrpc: '2.0',
+      method: 'notifications/claude/channel',
+      params: { content: `approved ${id}: rerun ${command}`, meta: { kind: 'gate_approved', request_id: id } },
+    })
+  }
+
   sendPermissionVerdict(request_id, behavior) {
     this._write({
       jsonrpc: '2.0',

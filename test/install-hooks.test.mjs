@@ -11,6 +11,9 @@ test('applyHookEdits adds the gate and tree hooks to an empty settings file', ()
   assert.ok(settings.hooks.Notification)
   assert.equal(settings.hooks.PermissionRequest, undefined)
   assert.ok(changes.some((c) => c.includes('project-gate.mjs')))
+  assert.equal(settings.hooks.UserPromptSubmit.length, 1)
+  assert.match(settings.hooks.UserPromptSubmit[0].hooks[0].command, /approve-hook\.mjs/)
+  assert.ok(changes.some((c) => c.includes('approve-hook.mjs')))
 })
 
 test('applyHookEdits is idempotent: running twice adds nothing new', () => {

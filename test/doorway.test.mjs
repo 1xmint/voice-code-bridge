@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
-import { holdForDecision } from '../hooks/project-gate.mjs'
+import { checkGate } from '../hooks/project-gate.mjs'
 
 const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -137,7 +137,7 @@ test('broken new code rolls back to the last copy that worked', async (t) => {
   assert.match(await door.call('send_to_code', { instruction: 'still there?' }), /task_id/)
 })
 
-test('with the doorway up and no worker, the gate hook falls back to ask, never allow', async (t) => {
+test('with the doorway up and no worker, the gate hook falls back to deny, never allow', async (t) => {
   const code = copyRepo()
   const door = await launch(t, path.join(code, 'bin', 'doorway.mjs'))
   await handshake(door)
@@ -146,6 +146,6 @@ test('with the doorway up and no worker, the gate hook falls back to ask, never 
   fs.rmSync(path.join(door.home, 'workers'), { recursive: true, force: true })
   process.kill(pid)
   await sleep(300)
-  const decision = await holdForDecision({ secret: door.secret, port: door.port, payload: { kind: 'bash', command: 'git push' }, timeoutMs: 2000, pollMs: 200 })
-  assert.equal(decision, 'ask')
+  const result = await checkGate({ secret: door.secret, port: door.port, command: 'git push', timeoutMs: 2000 })
+  assert.equal(result.allow, false)
 })

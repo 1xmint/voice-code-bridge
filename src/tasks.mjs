@@ -5,8 +5,12 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
 
-// A gate hold older than this is past the hook's 25s wait (see listPendingGates).
-const GATE_TTL_MS = 30_000
+// How long a pending gate stays answerable. The gate hook itself never
+// waits any more (see hooks/project-gate.mjs) -- this is purely how long a
+// later approval (voice, or a typed "approve <id>") has to arrive and still
+// find the gate pending. Passes issued on approval are shorter-lived (see
+// src/passes.mjs); this only bounds the *gate*, not the pass.
+const GATE_TTL_MS = 30 * 60_000
 
 // classifier_outage: Claude Code's auto-mode permission classifier is
 // temporarily unavailable, so Code is paused waiting to retry. Kept distinct
@@ -345,9 +349,8 @@ export class TaskStore {
     return this.gates.get(requestId) || null
   }
 
-  // The hook stops waiting after 25s and hands the prompt back to the
-  // terminal, so a gate still pending after that is already decided
-  // elsewhere; showing it to voice would invite an answer nobody receives.
+  // A gate pending past GATE_TTL_MS is treated as expired so voice doesn't
+  // offer to answer something too stale to matter.
   listPendingGates(now = Date.now()) {
     for (const g of this.gates.values()) {
       if (g.status === 'pending' && now - new Date(g.created_at).getTime() > GATE_TTL_MS) g.status = 'expired'
