@@ -7,7 +7,7 @@ const repo = 'C:/repo'
 test('applyHookEdits adds the gate and tree hooks to an empty settings file', () => {
   const settings = {}
   const changes = applyHookEdits(settings, repo)
-  assert.deepEqual(settings.hooks.PreToolUse.map((e) => e.matcher), ['Bash', '*'])
+  assert.deepEqual(settings.hooks.PreToolUse.map((e) => e.matcher), ['Bash', 'PowerShell', 'WebFetch', '*'])
   assert.ok(settings.hooks.Notification)
   assert.equal(settings.hooks.PermissionRequest, undefined)
   assert.ok(changes.some((c) => c.includes('project-gate.mjs')))

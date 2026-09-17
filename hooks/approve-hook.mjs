@@ -31,7 +31,16 @@ export async function handleUserPromptSubmit(input) {
   const secret = readSecret()
   if (!secret) return
   try {
-    await postJson({ port: getPort(), path: `/gate/${secret}`, body: { action: 'approve', id, approver: 'user' }, timeoutMs: 5000 })
+    // prompt + transcript_path travel with the request so the bridge can
+    // verify this really came from a typed reply in this session's
+    // transcript, not a forged POST claiming to be one (see
+    // verifyApprovalProof in src/http.mjs).
+    await postJson({
+      port: getPort(),
+      path: `/gate/${secret}`,
+      body: { action: 'approve', id, approver: 'user', prompt: input?.prompt, transcript_path: input?.transcript_path },
+      timeoutMs: 5000,
+    })
   } catch {
     // fail safe: no-op
   }

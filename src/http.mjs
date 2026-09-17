@@ -6,6 +6,7 @@
 import http from 'node:http'
 import crypto from 'node:crypto'
 import path from 'node:path'
+import fs from 'node:fs'
 import { DecisionLog } from './decisions.mjs'
 import { PassStore, hashCommand } from './passes.mjs'
 import { buildAgentTree } from './events.mjs'
@@ -585,12 +586,64 @@ async function handleRpc(msg, ctx) {
   }
 }
 
-// POST /gate/<secret> body: { action: 'register'|'poll'|'status', ... }.
-// Used by hooks/project-gate.mjs (PreToolUse) and a future permission-bridge
-// hook (PermissionRequest), which run as short-lived child processes and so
-// poll rather than hold a channel connection open. Never exposed as an MCP
-// tool: voice mode answers gates through the existing answer_code_permission
-// tool by request_id, same as any other pending approval.
+// Reads the latest type:'user' entry's message text out of a Claude Code
+// transcript JSONL file (~/.claude/projects/<proj>/<session>.jsonl or a
+// subagent sidecar). Returns null on any read/parse failure or if there's no
+// user entry -- callers must treat that as "no proof", never as a pass.
+function latestUserMessageText(transcriptPath) {
+  let content
+  try {
+    content = fs.readFileSync(transcriptPath, 'utf8')
+  } catch {
+    return null
+  }
+  const lines = content.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (!line) continue
+    let entry
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      continue // a torn last line from a concurrent write
+    }
+    if (entry.type !== 'user') continue
+    const content_ = entry.message?.content
+    if (typeof content_ === 'string') return content_
+    if (Array.isArray(content_)) {
+      const text = content_
+        .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join('')
+      return text || null
+    }
+    return null
+  }
+  return null
+}
+
+// Proof-of-user-prompt required for a gate 'approve': the id must actually
+// appear in the prompt text, and that exact prompt must be the latest real
+// user message in the named transcript -- not just claimed by whoever POSTed
+// this request. Fails closed: any missing piece (no id/prompt/transcript, a
+// transcript that doesn't parse, no user entry, a mismatched prompt) is
+// rejected, never approved. This is what stops a bare
+// `curl -d '{"action":"approve",...}'` from self-approving a held command:
+// there's no real transcript with that exact prompt as its latest user turn.
+export function verifyApprovalProof({ id, prompt, transcriptPath }) {
+  if (!id || !prompt || !transcriptPath) return false
+  if (!String(prompt).includes(id)) return false
+  const latest = latestUserMessageText(transcriptPath)
+  if (latest === null) return false
+  return latest.trim() === String(prompt).trim()
+}
+
+// POST /gate/<secret> body: { action: 'check'|'approve', ... }. Used by
+// hooks/project-gate.mjs (PreToolUse, action 'check') and
+// hooks/approve-hook.mjs (UserPromptSubmit, action 'approve'), which run as
+// short-lived child processes. Never exposed as an MCP tool: voice mode
+// answers gates through the existing answer_code_permission tool by
+// request_id, same as any other pending approval.
 async function handleGateRequest(body, tasks, log, passes, decisions, channel) {
   let parsed
   try {
@@ -599,17 +652,6 @@ async function handleGateRequest(body, tasks, log, passes, decisions, channel) {
     return { statusCode: 400, body: null }
   }
   const { action } = parsed || {}
-  if (action === 'register') {
-    const { request_id, tool_name, description, input_preview, repo, agent, command, kind, task_id } = parsed
-    const gate = tasks.registerGate({ request_id, tool_name, description, input_preview, repo, agent, command, kind, task_id })
-    log?.(`gate registered ${gate.request_id} kind=${gate.kind} tool=${gate.tool_name} repo=${gate.repo}`)
-    return { statusCode: 200, body: { request_id: gate.request_id, task_id: gate.task_id } }
-  }
-  if (action === 'poll' || action === 'status') {
-    const gate = tasks.getGate(parsed.request_id)
-    if (!gate) return { statusCode: 404, body: { status: 'unknown' } }
-    return { statusCode: 200, body: { status: gate.status } }
-  }
   // action 'check': the deny-now-approve-later gate check from
   // hooks/project-gate.mjs's PreToolUse hook. Consumes a matching pass if
   // one exists (one use only); otherwise registers the command as a pending
@@ -630,9 +672,16 @@ async function handleGateRequest(body, tasks, log, passes, decisions, channel) {
   // action 'approve': a typed "approve <id>"/"yes <id>" reply, forwarded by
   // hooks/approve-hook.mjs (UserPromptSubmit). Same effect as answering
   // 'allow' through answer_code_permission, just from a typed prompt instead
-  // of voice.
+  // of voice -- except this is the one path reachable by a bare HTTP POST
+  // (curl, a script, ...), so it requires proof of a real user prompt: see
+  // verifyApprovalProof. Without that, this would let the agent itself
+  // self-approve any held command with a single curl call.
   if (action === 'approve') {
-    const { id, approver } = parsed
+    const { id, approver, prompt, transcript_path } = parsed
+    if (!verifyApprovalProof({ id, prompt, transcriptPath: transcript_path })) {
+      log?.(`gate approve rejected for ${id}: no matching user prompt in transcript`)
+      return { statusCode: 200, body: { ok: false } }
+    }
     const gate = tasks.getGate(id)
     if (!gate || gate.status !== 'pending') return { statusCode: 200, body: { ok: false } }
     const hash = hashCommand(gate.command, gate.repo)
